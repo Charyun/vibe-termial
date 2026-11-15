@@ -1,0 +1,12 @@
+pub mod agents;
+pub mod model;
+pub mod paths;
+pub mod scroll;
+pub mod session;
+pub mod store;
+#[cfg(feature = "desktop")]
+pub mod tailscale;
+pub mod terminal;
+pub mod transcript;
+#[cfg(feature = "web")]
+pub mod web;

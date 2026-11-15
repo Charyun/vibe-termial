@@ -1,0 +1,6 @@
+/target/
+/.vendor/
+/.reference/
+/.local/
+*.log
+/.pi/

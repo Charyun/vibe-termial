@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <title>Vibe Terminal · 远程会话</title>
+  <link rel="stylesheet" href="/xterm.css">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/xterm.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <section id="login" class="login">
+    <form id="login-form" class="login-card">
+      <span class="brand">V</span><h1>Vibe Terminal</h1>
+      <p>连接电脑上的 AI 会话，随时继续工作。</p>
+      <label for="token">访问令牌</label>
+      <input id="token" type="password" autocomplete="off" required placeholder="粘贴桌面端生成的令牌">
+      <button class="primary" type="submit">连接会话</button>
+      <p id="login-error" role="alert"></p>
+      <small>支持局域网与 Tailscale。请先在桌面端开启 Web 访问。</small>
+    </form>
+  </section>
+  <section id="picker" class="picker" aria-label="选择会话" hidden>
+    <header class="picker-heading">
+      <strong><span class="brand">V</span> Vibe Terminal</strong>
+      <span id="picker-connection" role="status">连接中</span>
+    </header>
+    <div id="picker-list" class="picker-list"></div>
+    <footer class="picker-footer"><button id="picker-logout">断开连接</button></footer>
+  </section>
+  <div id="app" class="app" hidden>
+    <aside id="sidebar" aria-label="工作区与会话">
+      <div class="sidebar-heading"><strong><span class="brand">V</span> Vibe Terminal</strong><button id="hide-sidebar" aria-label="关闭会话列表">×</button></div>
+      <div id="workspaces"></div>
+      <footer><span id="connection" role="status">连接中</span><button id="logout">断开连接</button></footer>
+    </aside>
+    <button id="backdrop" class="backdrop" aria-label="关闭会话列表" hidden></button>
+    <main id="session-view">
+      <header>
+        <button id="back-to-picker" aria-label="返回会话列表">‹ 列表</button>
+        <button id="show-sidebar" aria-label="打开会话列表">☰</button>
+        <div class="session-heading"><strong id="title">选择一个会话</strong><small id="subtitle">桌面与 Web 共享同一终端进程</small></div>
+        <button id="keyboard" title="打开终端键盘">键盘</button>
+        <button id="start" disabled>恢复</button><button id="stop" disabled>停止</button>
+        <details class="more"><summary aria-label="更多会话操作">···</summary><div><button id="restart" disabled>重新启动</button><button id="close" class="danger" disabled>关闭会话</button></div></details>
+      </header>
+      <div id="notice" role="alert" hidden></div>
+      <section id="terminal-scroll" aria-label="终端输出"><div id="terminal"></div><div id="empty">从会话列表选择终端，或新建一个 AI 会话。</div></section>
+      <div id="keys" class="keys" aria-label="终端快捷键">
+        <button data-key="escape">Esc</button><button data-key="tab">Tab</button><button data-key="interrupt">Ctrl+C</button><button data-key="up">↑</button><button data-key="down">↓</button><button data-key="left">←</button><button data-key="right">→</button><button data-key="enter">Enter</button>
+      </div>
+      <form id="compose"><label class="sr-only" for="message">输入消息</label><textarea id="message" rows="2" placeholder="输入消息，支持中文与多行…" enterkeyhint="send"></textarea><button id="send" class="primary" disabled>发送</button></form>
+      <div class="hint">移动端自动换行，可上下滚动查看输出 · 停止或关闭前请确认任务状态</div>
+    </main>
+  </div>
+</body>
+</html>
