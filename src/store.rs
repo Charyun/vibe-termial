@@ -85,6 +85,21 @@ impl Store {
             }))?,
         )
     }
+    pub fn save_exited_agent(
+        &self,
+        tab: &crate::model::Tab,
+        runtime: Uuid,
+        history: &[u8],
+    ) -> Result<()> {
+        let directory = self.root.join("sessions").join("exited-agents");
+        fs::create_dir_all(&directory)?;
+        let stem = format!("{}-{runtime}", tab.id);
+        atomic_write(&directory.join(format!("{stem}.ansi")), history)?;
+        atomic_write(
+            &directory.join(format!("{stem}.json")),
+            &serde_json::to_vec_pretty(tab)?,
+        )
+    }
     pub fn save_history(&self, id: Uuid, bytes: &[u8]) -> Result<()> {
         atomic_write(&self.root.join("history").join(format!("{id}.ansi")), bytes)
     }

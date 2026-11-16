@@ -186,10 +186,12 @@ impl Session {
         if self.read_only {
             return;
         }
-        self.capture_metadata();
-        if self.terminals.get(&id).is_some_and(Terminal::running) {
+        // Opened terminals stay resident, including exited ones. Only an explicit
+        // restart removes the runtime and permits another process to be launched.
+        if self.terminals.get(&id).is_some_and(Terminal::loaded) {
             return;
         }
+        self.capture_metadata();
         let Some(tab) = self.data.tab(id).cloned() else {
             return;
         };
@@ -246,6 +248,90 @@ impl Session {
                 self.ensure_history();
             }
         }
+    }
+    /// Ctrl+C may only interrupt a turn. Return to a shell only after the
+    /// corresponding local Agent process has actually exited, never on restore failure.
+    pub fn return_exited_agents_to_shell(&mut self) -> Vec<Uuid> {
+        if self.read_only || self.stopped {
+            return Vec::new();
+        }
+        let data = &self.data;
+        let ids: Vec<_> = self
+            .terminals
+            .iter_mut()
+            .filter_map(|(id, terminal)| {
+                let agent = data
+                    .tab(*id)
+                    .is_some_and(|tab| tab.profile.kind != CliKind::Shell)
+                    && !data.is_remote_tab(*id);
+                if agent && terminal.interrupt_sent.load(Ordering::Acquire) && terminal.exited() {
+                    terminal.interrupt_sent.store(false, Ordering::Release);
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if ids.is_empty() {
+            return ids;
+        }
+        self.capture_metadata();
+        let mut changed = Vec::new();
+        for id in ids {
+            let Some(mut old) = self.terminals.remove(&id) else {
+                continue;
+            };
+            old.stop();
+            let result = (|| -> Result<Terminal> {
+                let mut tab = self
+                    .data
+                    .tab(id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("会话不存在"))?;
+                let mut buffer = old
+                    .buffer
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("终端缓冲区不可用"))?;
+                let history = buffer.snapshot();
+                let runtime = buffer.runtime_id;
+                (tab.rows, tab.cols) = buffer.parser.screen().size();
+                tab.cwd = buffer.parser.callbacks().cwd.clone();
+                drop(buffer);
+                // Preserve the Agent binding and full display history before changing the tab.
+                self.store.save_exited_agent(&tab, runtime, &history)?;
+                tab.profile = CliProfile::default_shell();
+                tab.title = tab.profile.name.clone();
+                tab.title_is_manual = false;
+                tab.session_summary = None;
+                tab.session_id = None;
+                tab.conversation_generation = tab.conversation_generation.wrapping_add(1);
+                let terminal = Terminal::start(
+                    &tab,
+                    &self.store.root.join("sessions"),
+                    tab.rows,
+                    tab.cols,
+                    self.wake.clone(),
+                )?;
+                if let Some(current) = self.data.tab_mut(id) {
+                    *current = tab;
+                }
+                Ok(terminal)
+            })();
+            match result {
+                Ok(terminal) => {
+                    self.terminals.insert(id, terminal);
+                    changed.push(id);
+                }
+                Err(error) => {
+                    self.terminals.insert(id, old);
+                    self.error = Some(format!("Agent 已退出，无法切回终端：{error:#}"));
+                }
+            }
+        }
+        if !changed.is_empty() {
+            self.persist();
+        }
+        changed
     }
     pub fn restart(&mut self, id: Uuid) {
         if let Some(mut t) = self.terminals.remove(&id) {

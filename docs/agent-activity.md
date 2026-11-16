@@ -4,6 +4,12 @@ The terminal tab and navigation row share the same indicator before the Agent ic
 
 Activity belongs to the terminal process buffer, independently of the selected workspace, file tab or conversation presentation. Completed notices survive unrelated output and repeated `done` reports. A new turn clears the previous result. History replay cannot issue terminal replies or generate completion notices.
 
+## Runtime lifetime
+
+Opening an unloaded tab starts/restores its CLI once. Once opened, the runtime and terminal buffer remain resident across tab and workspace switches, including its scrollback offset and exited state. Selection never restarts an already loaded runtime. Creating a new session or explicitly restarting replaces the runtime.
+
+Ctrl+C is forwarded to the Agent. If it only interrupts a turn, the Agent stays attached. After an interrupted local Agent process actually exits, the same tab starts the default shell (CMD on Windows). Its title and profile change together, so both navigation and terminal tabs show CMD and lose stale Agent indicators. The shell uses a fresh VT parser to avoid inheriting Agent mouse, alternate-screen, cursor or paste modes. The old Agent binding and ANSI history are first saved under `sessions/exited-agents/<tab-id>-<runtime-id>.json` and `.ansi`; an archival failure retains the original tab. Failed restore attempts do not trigger this shell return. Remote SSH sessions are not replaced with a local shell.
+
 ## State sources
 
 - OSC 7501 program status, including its capability query, is handled directly by the VT parser. Root state and live child state are folded together so a parent finishing while its children are working does not prematurely show completion.
@@ -15,10 +21,10 @@ Unknown Agents require an explicit status producer; process liveness alone is in
 ## Verification
 
 ```text
-cargo test --offline --locked --lib --test activity --test activity_notify -- --test-threads=1
+cargo test --offline --locked --lib --test activity --test activity_notify --test agent_exit --test restore --test session -- --test-threads=1
 cargo test --offline --locked --bin vibe-terminal native_agent_tab_spins_completes_and_clears_on_click -- --ignored --test-threads=1
 ```
 
-The integration fixture runs actual PTYs and appends real-shaped Pi session records, exercising native status when transported and the log fallback on Windows. The UI test uses the product assets and window options, verifies a background tab completion, physically clicks its status slot, and checks that the notice stays cleared. Set `VIBE_NATIVE_CAPTURE_DIR` to generate working/completed/acknowledged PNGs through `scripts/capture-window.ps1`. No model requests are needed.
+The integration fixture runs actual PTYs and appends real-shaped Pi session records, exercising native status when transported and the log fallback on Windows. The UI test uses the product assets and window options, verifies a background completion, dispatches native mouse messages to both navigation and tabs, and checks acknowledgment. It injects Ctrl+C at the window input-dispatch layer, verifies that a running Agent survives the first interrupt, then checks actual process exit, CMD execution, both surfaces returning to CMD and buffer reuse after switching. This input path also works without foreground activation on a locked or background desktop. Set `VIBE_NATIVE_CAPTURE_DIR` to generate status and returned-CMD PNGs through `scripts/capture-window.ps1`. No model requests are needed.
 
 Reference: [Orca Agent status integrations](https://github.com/stablyai/orca/blob/main/src/main/agent-hooks/README.md).

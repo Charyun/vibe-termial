@@ -403,13 +403,13 @@ impl Ui {
             demo: false,
         };
         ui.refresh();
-        // 启动时自动恢复上次选中的会话，避免“历史已加载但进程未启动”的状态。
+        // 启动时只恢复尚未加载的选中会话。
         if let Some(id) = ui.session.selected()
             && !ui
                 .session
                 .terminals
                 .get(&id)
-                .is_some_and(|terminal| terminal.running())
+                .is_some_and(|terminal| terminal.loaded())
         {
             ui.session.restore(id);
             ui.refresh();
@@ -756,12 +756,12 @@ impl Ui {
         self.session.select_tab(id);
         self.selection = None;
         self.preedit.clear();
-        // 切到休眠标签时直接恢复会话，不再需要单独的“恢复”按钮。
+        // 首次打开休眠标签才恢复；已打开（包括已退出）的运行时驻留到关闭。
         if !self
             .session
             .terminals
             .get(&id)
-            .is_some_and(|terminal| terminal.running())
+            .is_some_and(|terminal| terminal.loaded())
         {
             self.session.restore(id);
         }

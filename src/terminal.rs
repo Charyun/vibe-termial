@@ -174,6 +174,7 @@ pub struct Terminal {
     pub buffer: Arc<Mutex<Buffer>>,
     pub dirty: Arc<AtomicBool>,
     pub ended: Arc<AtomicBool>,
+    pub interrupt_sent: AtomicBool,
     input: Option<SyncSender<Vec<u8>>>,
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
@@ -194,6 +195,7 @@ impl Terminal {
             buffer: Arc::new(Mutex::new(buffer)),
             dirty: Arc::new(AtomicBool::new(true)),
             ended: Arc::new(AtomicBool::new(false)),
+            interrupt_sent: AtomicBool::new(false),
             input: None,
             master: None,
             child: None,
@@ -353,6 +355,7 @@ impl Terminal {
             buffer: shared,
             dirty,
             ended,
+            interrupt_sent: AtomicBool::new(false),
             input: Some(tx),
             master: Some(pair.master),
             child: Some(child),
@@ -397,6 +400,11 @@ impl Terminal {
     pub fn running(&self) -> bool {
         self.child.is_some() && !self.ended.load(Ordering::Acquire)
     }
+    pub fn exited(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().is_ok_and(|status| status.is_some()))
+    }
     pub fn loaded(&self) -> bool {
         self.was_started
     }
@@ -404,11 +412,16 @@ impl Terminal {
         if !self.running() {
             bail!("终端未运行，请恢复会话或新建终端");
         }
+        let interrupt = bytes == b"\x03";
         self.input
             .as_ref()
             .context("终端输入已关闭")?
             .try_send(bytes)
-            .context("终端输入繁忙，请稍后重试")
+            .context("终端输入繁忙，请稍后重试")?;
+        if interrupt {
+            self.interrupt_sent.store(true, Ordering::Release);
+        }
+        Ok(())
     }
     pub fn paste(&self, text: &str) -> Result<()> {
         let bracketed = self

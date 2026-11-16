@@ -3,7 +3,7 @@ if (process.stdin.isTTY) process.stdin.setRawMode(true);
 const sessionIndex = process.argv.indexOf('--session');
 const tape = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : undefined;
 if (tape) fs.writeFileSync(tape, '');
-let incoming = '', ready = false, sequence = 0;
+let incoming = '', ready = false, sequence = 0, interrupts = 0;
 function status(state) {
   process.stdout.write(`\x1b]7501;state=${state}:app=fixture\x1b\\`);
   if (!tape) return;
@@ -32,6 +32,12 @@ process.stdin.on('data', data => {
     else if (key === 'B') status('blocked');
     else if (key === 'E') status('error');
     else if (key === 'I') status('idle');
+    else if (key === '\x03') {
+      if (++interrupts === 1) {
+        status('idle');
+        process.stdout.write('AGENT_INTERRUPTED\r\n');
+      } else process.exit(0);
+    } else if (key === 'Q') process.exit(0);
   }
   incoming = '';
 });

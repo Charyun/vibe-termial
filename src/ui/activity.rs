@@ -150,7 +150,18 @@ impl Ui {
                 }
                 if weak
                     .update(cx, |ui, cx| {
-                        if ui.refresh_agent_activity() {
+                        let previous_error = ui.session.error.clone();
+                        let returned = ui.session.return_exited_agents_to_shell();
+                        if !returned.is_empty() {
+                            for id in &returned {
+                                ui.conversations.remove(id);
+                            }
+                            ui.refresh();
+                        }
+                        if ui.refresh_agent_activity()
+                            || !returned.is_empty()
+                            || previous_error != ui.session.error
+                        {
                             cx.notify();
                         }
                     })

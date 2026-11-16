@@ -53,10 +53,11 @@ fn mouse(message: u32, down: bool, scale: f32, sidebar: bool) {
     }
 }
 #[test]
-#[ignore = "opens a native window, drives local PTYs and clicks the completed Agent tab"]
+#[ignore = "opens a native window, drives local PTYs and verifies Agent status and Ctrl+C exit"]
 fn native_agent_tab_spins_completes_and_clears_on_click() {
     let root = std::env::temp_dir().join(format!("vibe-activity-ui-{}", Uuid::new_v4()));
     fs::create_dir_all(root.join("sessions")).unwrap();
+    fs::create_dir_all(root.join("history")).unwrap();
     let helper = root.join("agent.cjs");
     fs::write(
         &helper,
@@ -209,6 +210,60 @@ fn native_agent_tab_spins_completes_and_clears_on_click() {
                         Some(Indicator::None)
                     );
                     capture("acknowledged").await;
+                    let original = cx.update(|cx| view.read(cx).session.terminals[&first].buffer.clone());
+                    handle.update(cx, |_, window, cx| {
+                        view.update(cx, |ui, cx| ui.focus_current_view(window, cx));
+                        window.dispatch_event(gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+                            keystroke: gpui_kit::Keystroke::parse("ctrl-c").unwrap(),
+                            is_held: false, prefer_character_input: false,
+                        }), cx);
+                    }).unwrap();
+                    smol::Timer::after(Duration::from_millis(350)).await;
+                    cx.update(|cx| {
+                        let ui = view.read(cx);
+                        assert_eq!(ui.session.data.tab(first).unwrap().profile.kind, CliKind::Pi);
+                        assert!(Arc::ptr_eq(&original, &ui.session.terminals[&first].buffer));
+                    });
+                    handle.update(cx, |_, window, cx| {
+                        window.dispatch_event(gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+                            keystroke: gpui_kit::Keystroke::parse("ctrl-c").unwrap(),
+                            is_held: false, prefer_character_input: false,
+                        }), cx);
+                    }).unwrap();
+                    let mut returned = false;
+                    for _ in 0..100 {
+                        smol::Timer::after(Duration::from_millis(50)).await;
+                        returned = cx.update(|cx| view.read(cx).session.data.tab(first).unwrap().profile.kind == CliKind::Shell);
+                        if returned { break; }
+                    }
+                    assert!(returned, "Ctrl+C exiting the Agent must return the same navigation row and tab to CMD");
+                    let shell = cx.update(|cx| {
+                        let ui = view.read(cx);
+                        assert_eq!(ui.session.data.tab(first).unwrap().display_title(), "CMD");
+                        assert!(ui.agent_activity_indicator(first, "sidebar").is_none());
+                        assert!(ui.agent_activity_indicator(first, "tab").is_none());
+                        let terminal = &ui.session.terminals[&first];
+                        let buffer = terminal.buffer.lock().unwrap();
+                        assert!(!buffer.parser.screen().alternate_screen());
+                        assert!(!buffer.parser.screen().bracketed_paste());
+                        terminal.buffer.clone()
+                    });
+                    handle.update(cx, |_, window, cx| view.update(cx, |ui, cx| {
+                        let other = ui.session.data.workspace().unwrap().tabs.iter().find(|t| t.id != first).unwrap().id;
+                        ui.select_tab(other, window, cx);
+                        ui.select_tab(first, window, cx);
+                        assert!(Arc::ptr_eq(&shell, &ui.session.terminals[&first].buffer));
+                        ui.session.send(b"echo NATIVE_CMD_RETURN_OK\r".to_vec());
+                    })).unwrap();
+                    let mut executed = false;
+                    for _ in 0..100 {
+                        smol::Timer::after(Duration::from_millis(50)).await;
+                        executed = cx.update(|cx| view.read(cx).session.terminals[&first].buffer.lock().unwrap().parser.screen().contents().lines().any(|line| line.trim() == "NATIVE_CMD_RETURN_OK"));
+                        if executed { break; }
+                    }
+                    assert!(executed, "returned CMD must execute commands after switching away and back");
+                    assert!(cx.update(|cx| view.read(cx).session.error.is_none()), "native fixture must not leave a persistence error");
+                    capture("returned-cmd").await;
                 })
                 .catch_unwind()
                 .await;
