@@ -72,7 +72,7 @@ impl Session {
                     .iter()
                     .map(|w| {
                         let tabs: Vec<_> = w.tabs.iter().map(|t| json!({
-                        "id": t.id, "title": t.title, "profile": t.profile.name,
+                        "id": t.id, "title": t.display_title(), "profile": t.profile.name,
                         "running": self.terminals.get(&t.id).is_some_and(|t| t.running()),
                         "instance": self.terminals.get(&t.id).map(|t| t.instance),
                     })).collect();
@@ -135,7 +135,7 @@ impl Session {
                 if matches!(command, Command::Restart { .. }) {
                     self.restart(id);
                 } else {
-                    self.start(id);
+                    self.restore(id);
                 }
                 if let Some(error) = self.error.take() {
                     bail!("{error}");

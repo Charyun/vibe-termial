@@ -1,6 +1,6 @@
 //! Workspace and terminal lifecycle, independent of any GUI toolkit.
 use crate::{
-    model::{AppData, CliKind, CliProfile, Tab, WorkspacePage},
+    model::{AppData, CliKind, CliProfile, Tab},
     store::Store,
     terminal::Terminal,
 };
@@ -41,9 +41,6 @@ impl Session {
     pub fn selected(&self) -> Option<Uuid> {
         self.data.workspace().and_then(|w| w.selected_tab)
     }
-    pub fn page(&self) -> WorkspacePage {
-        self.data.workspace().map(|w| w.page).unwrap_or_default()
-    }
     pub fn result(&mut self, result: Result<()>) {
         if let Err(e) = result {
             self.error = Some(format!("{e:#}"));
@@ -64,21 +61,17 @@ impl Session {
     pub fn select_workspace(&mut self, id: Uuid) {
         self.data.selected_workspace = Some(id);
         self.terminals.retain(|_, t| t.loaded());
-        if self.page() == WorkspacePage::Terminal {
-            self.ensure_history();
-        }
-        self.persist();
-    }
-    pub fn overview(&mut self) {
-        if let Some(w) = self.data.workspace_mut() {
-            w.page = WorkspacePage::Overview;
-        }
+        self.ensure_history();
         self.persist();
     }
     pub fn select_tab(&mut self, id: Uuid) {
+        if let Some(terminal) = self.terminals.get(&id)
+            && let Ok(mut buffer) = terminal.buffer.lock()
+        {
+            buffer.parser.callbacks_mut().activity.acknowledge();
+        }
         if let Some(w) = self.data.workspace_mut() {
             w.selected_tab = Some(id);
-            w.page = WorkspacePage::Terminal;
         }
         self.terminals.retain(|key, t| *key == id || t.loaded());
         self.ensure_history();
@@ -105,9 +98,29 @@ impl Session {
                         &bytes,
                     ),
                 );
+                if self.data.is_remote_tab(id) {
+                    if let Some(term) = self.terminals.get(&id) {
+                        term.mark_remote(tab.cwd.clone());
+                    }
+                }
             }
             Err(e) => self.error = Some(format!("无法读取历史：{e:#}")),
         }
+    }
+    pub fn add_remote_workspace(
+        &mut self,
+        host_id: Uuid,
+        path: String,
+        name: String,
+    ) -> Result<Uuid> {
+        let id = self.data.add_remote_workspace(host_id, path, name)?;
+        self.select_workspace(id);
+        if self.data.workspace().is_some_and(|w| w.tabs.is_empty()) {
+            self.new_tab(crate::ssh::profiles().remove(0));
+        } else if let Some(tab) = self.selected() {
+            self.restore(tab);
+        }
+        Ok(id)
     }
     pub fn new_tab(&mut self, profile: CliProfile) {
         let Some(w) = self.data.workspace_mut() else {
@@ -117,11 +130,59 @@ impl Session {
         let id = tab.id;
         w.tabs.push(tab);
         w.selected_tab = Some(id);
-        w.page = WorkspacePage::Terminal;
         self.persist();
         self.start(id);
     }
+    fn skip_failed_restore(&mut self, id: Uuid) {
+        let saved = {
+            let Some(workspace) = self
+                .data
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.tabs.iter().any(|tab| tab.id == id))
+            else {
+                return;
+            };
+            let Some(tab) = workspace.tabs.iter().find(|tab| tab.id == id) else {
+                return;
+            };
+            self.store.save_failed_restore(workspace, tab)
+        };
+        if let Err(error) = saved {
+            self.error = Some(format!("无法保留恢复失败的会话资料：{error:#}"));
+            return;
+        }
+        self.terminals.remove(&id);
+        if let Some(workspace) = self
+            .data
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.tabs.iter().any(|tab| tab.id == id))
+        {
+            let index = workspace
+                .tabs
+                .iter()
+                .position(|tab| tab.id == id)
+                .unwrap_or(0);
+            workspace.tabs.retain(|tab| tab.id != id);
+            if workspace.selected_tab == Some(id) {
+                workspace.selected_tab = workspace
+                    .tabs
+                    .get(index.min(workspace.tabs.len().saturating_sub(1)))
+                    .map(|tab| tab.id);
+            }
+        }
+        self.error = None;
+        self.persist();
+    }
+    pub fn restore(&mut self, id: Uuid) {
+        self.start_inner(id, true);
+    }
     pub fn start(&mut self, id: Uuid) {
+        let restoring = self.data.tab(id).is_some_and(|tab| tab.launched);
+        self.start_inner(id, restoring);
+    }
+    fn start_inner(&mut self, id: Uuid, restoring: bool) {
         if self.read_only {
             return;
         }
@@ -132,13 +193,41 @@ impl Session {
         let Some(tab) = self.data.tab(id).cloned() else {
             return;
         };
-        match Terminal::start(
-            &tab,
-            &self.store.root.join("sessions"),
-            self.grid.0,
-            self.grid.1,
-            self.wake.clone(),
-        ) {
+        if restoring
+            && tab.profile.kind == CliKind::Codex
+            && tab
+                .session_id
+                .as_ref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            self.skip_failed_restore(id);
+            return;
+        }
+        let result = if let Some(project) = self.data.remote_for_tab(id) {
+            match self.data.ssh_hosts.iter().find(|h| h.id == project.host_id) {
+                Some(host) => Terminal::start_ssh(
+                    &tab,
+                    &self.store.root.join("sessions"),
+                    host,
+                    project,
+                    self.grid.0,
+                    self.grid.1,
+                    self.wake.clone(),
+                ),
+                None => Err(anyhow::anyhow!(
+                    "该工作区的 SSH 主机已不存在，请在设置中检查主机配置"
+                )),
+            }
+        } else {
+            Terminal::start(
+                &tab,
+                &self.store.root.join("sessions"),
+                self.grid.0,
+                self.grid.1,
+                self.wake.clone(),
+            )
+        };
+        match result {
             Ok(term) => {
                 if let Some(mut old) = self.terminals.remove(&id) {
                     old.stop();
@@ -151,6 +240,7 @@ impl Session {
                 self.error = None;
                 self.persist();
             }
+            Err(_) if restoring => self.skip_failed_restore(id),
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
                 self.ensure_history();
@@ -164,6 +254,8 @@ impl Session {
         }
         if let Some(tab) = self.data.tab_mut(id) {
             tab.launched = false;
+            tab.session_summary = None;
+            tab.conversation_generation = tab.conversation_generation.wrapping_add(1);
             tab.session_id =
                 (tab.profile.kind == CliKind::Claude).then(|| Uuid::new_v4().to_string());
         }
@@ -199,9 +291,6 @@ impl Session {
                     .get(index.min(w.tabs.len().saturating_sub(1)))
                     .map(|t| t.id);
             }
-            if w.tabs.is_empty() {
-                w.page = WorkspacePage::Overview;
-            }
         }
         if !self.read_only {
             self.store.delete_history(id);
@@ -230,12 +319,76 @@ impl Session {
         self.ensure_history();
         self.persist();
     }
+    pub fn note_codex_submission(&self, id: Uuid) {
+        if self.data.is_remote_tab(id)
+            || !self
+                .data
+                .tab(id)
+                .is_some_and(|tab| tab.profile.kind == CliKind::Codex)
+        {
+            return;
+        }
+        if let Some(terminal) = self
+            .terminals
+            .get(&id)
+            .filter(|terminal| terminal.running())
+            && let Ok(mut buffer) = terminal.buffer.lock()
+        {
+            buffer.parser.callbacks_mut().activity.submitted();
+        }
+    }
     pub fn send(&mut self, bytes: Vec<u8>) {
-        if let Some(t) = self.selected().and_then(|id| self.terminals.get(&id)) {
+        self.send_input(bytes, false);
+    }
+    pub fn send_input(&mut self, bytes: Vec<u8>, has_image: bool) {
+        let Some(id) = self.selected() else {
+            return;
+        };
+        if let Some(t) = self.terminals.get(&id) {
+            let submit = bytes == b"\r";
+            let interrupt = bytes == b"\x1b" || bytes == b"\x03";
+            let codex = (submit || interrupt)
+                && !self.data.is_remote_tab(id)
+                && self
+                    .data
+                    .tab(id)
+                    .is_some_and(|tab| tab.profile.kind == CliKind::Codex);
+            let mut starts_turn = false;
             if let Ok(mut b) = t.buffer.lock() {
                 b.parser.screen_mut().set_scrollback(0);
+                if codex && submit {
+                    starts_turn = has_image
+                        || b.parser
+                            .screen()
+                            .rows(0, b.parser.screen().size().1)
+                            .take(b.parser.screen().cursor_position().0 as usize + 1)
+                            .collect::<Vec<_>>()
+                            .iter()
+                            .rev()
+                            .take(30)
+                            .find_map(|line| {
+                                let line = line.trim_start();
+                                line.strip_prefix('›')
+                                    .or_else(|| line.strip_prefix('❯'))
+                                    .map(|text| {
+                                        !text.trim().is_empty()
+                                            && !text.trim_start().starts_with('/')
+                                    })
+                            })
+                            .unwrap_or(false);
+                }
             }
             let result = t.send(bytes);
+            if result.is_ok()
+                && codex
+                && let Ok(mut buffer) = t.buffer.lock()
+            {
+                if starts_turn {
+                    buffer.parser.callbacks_mut().activity.submitted();
+                } else if interrupt {
+                    buffer.parser.callbacks_mut().activity.interrupted();
+                }
+            }
             self.result(result);
         }
     }
@@ -264,7 +417,13 @@ impl Session {
         for t in self.terminals.values() {
             t.update_cwd();
         }
-        for tab in self.data.workspaces.iter_mut().flat_map(|w| &mut w.tabs) {
+        for tab in self
+            .data
+            .workspaces
+            .iter_mut()
+            .filter(|w| w.remote.is_none())
+            .flat_map(|w| &mut w.tabs)
+        {
             if tab.profile.kind != CliKind::Codex {
                 continue;
             }

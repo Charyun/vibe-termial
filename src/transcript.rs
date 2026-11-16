@@ -39,7 +39,7 @@ pub struct Transcript {
     pub messages: Vec<Message>,
 }
 
-/// 定位标签对应的会话文件；目前支持 Pi 与 Codex。
+/// 定位标签对应的 Pi、Codex 或 Claude 结构化会话文件。
 pub fn locate(tab: &Tab, data_root: &Path) -> Option<PathBuf> {
     match tab.profile.kind {
         CliKind::Pi => {
@@ -47,14 +47,31 @@ pub fn locate(tab: &Tab, data_root: &Path) -> Option<PathBuf> {
             path.is_file().then_some(path)
         }
         CliKind::Codex => tab.session_id.as_deref().and_then(find_codex_session),
+        CliKind::Claude => {
+            let id = tab.session_id.as_deref()?;
+            uuid::Uuid::parse_str(id).ok()?;
+            let root = agent_home("CLAUDE_CONFIG_DIR", ".claude")?.join("projects");
+            newest_matching(&root, &|name| name == format!("{id}.jsonl"), 0)
+        }
         _ => None,
     }
 }
 
 /// 在 `~/.codex/sessions` 里按 thread-id 找最新的 rollout 文件。
+pub(crate) fn agent_home(variable: &str, directory: &str) -> Option<PathBuf> {
+    std::env::var_os(variable)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|home| PathBuf::from(home).join(directory))
+        })
+}
+
 fn find_codex_session(thread: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let root = PathBuf::from(home).join(".codex").join("sessions");
+    uuid::Uuid::parse_str(thread).ok()?;
+    let root = agent_home("CODEX_HOME", ".codex")?.join("sessions");
     newest_matching(
         &root,
         &|name| name.contains(thread) && name.ends_with(".jsonl"),
@@ -122,17 +139,41 @@ pub fn parse(text: &str) -> Vec<Message> {
     messages
 }
 
-fn message_from(value: &Value) -> Option<Message> {
+pub(crate) fn message_from(value: &Value) -> Option<Message> {
     // Codex: response_item -> payload{type:message, role, content[]}
     if value.get("type").and_then(Value::as_str) == Some("response_item") {
         let payload = value.get("payload")?;
-        if payload.get("type").and_then(Value::as_str) != Some("message") {
-            return None;
+        match payload.get("type").and_then(Value::as_str)? {
+            "message" => return build_message(payload),
+            "function_call" => {
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("工具");
+                let arguments = payload
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                return Some(Message {
+                    role: Role::Tool,
+                    text: format!("{name}\n{arguments}"),
+                });
+            }
+            "function_call_output" => {
+                let output = text_of(payload.get("output")?)?;
+                return Some(Message {
+                    role: Role::Tool,
+                    text: output,
+                });
+            }
+            _ => return None,
         }
-        return build_message(payload);
     }
     // Pi / Claude: message -> {role, content[]}
-    if value.get("type").and_then(Value::as_str) == Some("message") {
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("message" | "user" | "assistant")
+    ) {
         return build_message(value.get("message")?);
     }
     // 顶层直接是 {role, content}
@@ -147,7 +188,7 @@ fn build_message(payload: &Value) -> Option<Message> {
         "user" => Role::User,
         "assistant" => Role::Assistant,
         "system" => Role::System,
-        "tool" => Role::Tool,
+        "tool" | "toolResult" => Role::Tool,
         _ => return None,
     };
     let text = text_of(payload.get("content")?)?;
@@ -162,6 +203,12 @@ fn text_of(content: &Value) -> Option<String> {
             for item in items {
                 if let Some(text) = item.get("text").and_then(Value::as_str) {
                     parts.push(text.to_owned());
+                } else if matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("image" | "input_image" | "image_url")
+                ) {
+                    // Keep image-only turns visible without leaking embedded base64 into the UI.
+                    parts.push("[图片]".into());
                 }
             }
             (!parts.is_empty()).then(|| parts.join("\n"))
@@ -173,6 +220,16 @@ fn text_of(content: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_only_agent_turns_are_visible_without_embedded_image_data() {
+        for kind in ["image", "input_image", "image_url"] {
+            let line = serde_json::json!({"role":"user","content":[{"type":kind,"data":"private-base64","image_url":"data:image/png;base64,private-base64"}]}).to_string();
+            let messages = parse(&line);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].text, "[图片]");
+        }
+    }
 
     #[test]
     fn parses_codex_response_items_and_skips_events() {
@@ -224,6 +281,24 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn conversation_includes_pi_tool_results_and_codex_tool_calls() {
+        let text = concat!(
+            r#"{"type":"message","message":{"role":"toolResult","content":[{"type":"text","text":"读取完成"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"main.rs\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","output":"file contents"}}"#,
+            "\n",
+        );
+        let messages = parse(text);
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().all(|message| message.role == Role::Tool));
+        assert_eq!(messages[0].text, "读取完成");
+        assert!(messages[1].text.contains("read_file"));
+        assert_eq!(messages[2].text, "file contents");
     }
 
     #[test]

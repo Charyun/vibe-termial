@@ -18,7 +18,6 @@ The PTY regression test also requires the first output to notify an event-driven
 | Scenario | Result | Evidence |
 | --- | --- | --- |
 | Open saved terminal without launching its process | Historical output displayed with a dormant indicator and restore action | [Restored terminal](screenshots/restored.png) |
-| Switch to a non-terminal page | Real project overview, directory and live terminal-count cards render | [Overview](screenshots/overview.png) |
 | Ctrl+click `src/main.rs:12` | Opens real source asynchronously with syntax highlighting and line 12 highlighted | [Code preview](screenshots/code-preview.png) |
 | Ctrl+click an existing PNG path | Opens the actual local image in a fitted preview | [Image preview](screenshots/image-preview.png) |
 | Restore PowerShell and submit a command | Actual output contains `NATIVE_PTY_OK` and `中文输入测试` | [Live terminal](screenshots/live-terminal.png) |
@@ -39,7 +38,7 @@ Window capture must use a DPI-aware thread before querying window bounds. A DPI-
 - Release-build memory, CPU, startup time and sustained multi-terminal output workloads.
 - Code signing, macOS notarization and distribution packaging.
 
-The application currently provides terminal management, a native project overview and local file/image previews. No model API, streaming chat backend or AI tool-call engine is connected by this migration.
+The application currently provides terminal management and local file/image previews. Workspaces open directly in their terminal area, with a create-terminal entry when no tabs exist. No model API, streaming chat backend or AI tool-call engine is connected by this migration.
 
 ## 桌面端 MVP 验收
 
@@ -49,7 +48,7 @@ The application currently provides terminal management, a native project overvie
 | --- | --- |
 | 设置页 Agent 分类 | 列出本机已安装 Agent 与可执行文件路径；点「已隐藏」后该项不再出现在 ＋ 菜单 |
 | 新建 Claude Code 标签并对话一轮，关闭应用后重开 | 启动即自动恢复：参数含 `--resume <首次的 session-id>`，会话内能看到上一轮内容 |
-| 新建 Codex 标签完成一轮（notify 回调写入 thread-id），关闭应用后重开 | 启动即自动恢复，参数为 `resume <thread-id>`，能继续原对话；ID 缺失时终端内直接报错 |
+| 新建 Codex 标签完成一轮（notify 回调写入 thread-id），关闭应用后重开 | 启动即自动恢复，参数为 `resume <thread-id>`，能继续原对话；ID 缺失时跳过该标签的恢复，不显示恢复提示、不创建替代终端，保留历史和 `failed-restores` 标签资料 |
 | 新建 Pi 标签对话一轮后关闭重开 | 启动即自动恢复，参数为 `--session <同一 jsonl 路径>`，Pi 恢复原会话 |
 | 强杀应用进程（任务管理器结束进程） | 关联 CLI 与 `conhost.exe` 一并退出，无孤儿进程 |
 | `Ctrl + Tab` / `Ctrl + 1…9` / `Ctrl + /` | 切换标签、跳标签、打开设置里的快捷键页 |

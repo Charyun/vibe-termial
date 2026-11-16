@@ -129,6 +129,12 @@ impl CliProfile {
 pub struct Tab {
     pub id: Uuid,
     pub title: String,
+    #[serde(default)]
+    pub session_summary: Option<String>,
+    #[serde(default)]
+    pub title_is_manual: bool,
+    #[serde(default)]
+    pub conversation_generation: u64,
     pub profile: CliProfile,
     pub cwd: PathBuf,
     pub session_id: Option<String>,
@@ -152,6 +158,9 @@ impl Tab {
         Self {
             id: Uuid::new_v4(),
             title: profile.name.clone(),
+            session_summary: None,
+            title_is_manual: false,
+            conversation_generation: 0,
             profile,
             cwd,
             session_id,
@@ -159,6 +168,29 @@ impl Tab {
             rows: default_rows(),
             cols: default_cols(),
         }
+    }
+
+    pub fn accepts_session_summary(&self) -> bool {
+        !self.title_is_manual
+            && self.profile.kind != CliKind::Shell
+            && (self.title == self.profile.name
+                || self
+                    .title
+                    .strip_prefix(&format!("{} ", self.profile.name))
+                    .is_some_and(|suffix| suffix.parse::<usize>().is_ok()))
+    }
+
+    pub fn display_title(&self) -> &str {
+        if self.accepts_session_summary() {
+            self.session_summary.as_deref().unwrap_or(&self.title)
+        } else {
+            &self.title
+        }
+    }
+
+    pub fn rename(&mut self, title: String) {
+        self.title = title;
+        self.title_is_manual = true;
     }
 
     /// Arguments are passed separately, never interpolated into a shell expression.
@@ -203,14 +235,6 @@ impl Tab {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspacePage {
-    #[default]
-    Terminal,
-    Overview,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Uuid,
@@ -219,7 +243,15 @@ pub struct Workspace {
     pub tabs: Vec<Tab>,
     pub selected_tab: Option<Uuid>,
     #[serde(default)]
-    pub page: WorkspacePage,
+    pub remote: Option<crate::ssh::SshProject>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputCursorStyle {
+    #[default]
+    Block,
+    Bar,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -231,6 +263,10 @@ pub struct AppData {
     /// 用户在设置里关掉的 Agent（自动检测结果中不显示、也不进 ＋ 菜单）。
     #[serde(default)]
     pub disabled_agents: Vec<String>,
+    #[serde(default)]
+    pub input_cursor_style: InputCursorStyle,
+    #[serde(default)]
+    pub ssh_hosts: Vec<crate::ssh::SshHost>,
 }
 
 impl Default for AppData {
@@ -241,11 +277,67 @@ impl Default for AppData {
             selected_workspace: None,
             profiles: CliProfile::defaults(),
             disabled_agents: vec![],
+            input_cursor_style: InputCursorStyle::default(),
+            ssh_hosts: vec![],
         }
     }
 }
 
 impl AppData {
+    pub fn is_remote_tab(&self, id: Uuid) -> bool {
+        self.workspaces
+            .iter()
+            .any(|w| w.remote.is_some() && w.tabs.iter().any(|tab| tab.id == id))
+    }
+    pub fn remote_for_tab(&self, id: Uuid) -> Option<&crate::ssh::SshProject> {
+        self.workspaces
+            .iter()
+            .find(|w| w.tabs.iter().any(|tab| tab.id == id))
+            .and_then(|w| w.remote.as_ref())
+    }
+    pub fn add_remote_workspace(
+        &mut self,
+        host_id: Uuid,
+        path: String,
+        name: String,
+    ) -> Result<Uuid> {
+        let host = self
+            .ssh_hosts
+            .iter()
+            .find(|h| h.id == host_id)
+            .ok_or_else(|| anyhow::anyhow!("SSH 主机已移除，请先在设置中添加主机"))?;
+        host.validate()?;
+        crate::ssh::validate_project_path(&path)?;
+        if let Some(existing) = self.workspaces.iter().find(|w| {
+            w.remote
+                .as_ref()
+                .is_some_and(|r| r.host_id == host_id && r.path == path)
+        }) {
+            self.selected_workspace = Some(existing.id);
+            return Ok(existing.id);
+        }
+        let id = Uuid::new_v4();
+        let name = if name.trim().is_empty() {
+            path.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|n| !n.is_empty() && *n != "~")
+                .unwrap_or(&host.name)
+                .to_owned()
+        } else {
+            name.trim().to_owned()
+        };
+        self.workspaces.push(Workspace {
+            id,
+            name,
+            directory: PathBuf::from(&path),
+            tabs: vec![],
+            selected_tab: None,
+            remote: Some(crate::ssh::SshProject { host_id, path }),
+        });
+        self.selected_workspace = Some(id);
+        Ok(id)
+    }
     pub fn add_workspace(&mut self, path: &Path) -> Result<Uuid> {
         if !path.is_dir() {
             bail!("请选择存在的本地项目目录");
@@ -254,7 +346,7 @@ impl AppData {
         if let Some(existing) = self
             .workspaces
             .iter()
-            .find(|w| crate::paths::local_path(&w.directory) == directory)
+            .find(|w| w.remote.is_none() && crate::paths::local_path(&w.directory) == directory)
         {
             self.selected_workspace = Some(existing.id);
             return Ok(existing.id);
@@ -270,7 +362,7 @@ impl AppData {
             directory,
             tabs: vec![],
             selected_tab: None,
-            page: WorkspacePage::Overview,
+            remote: None,
         });
         self.selected_workspace = Some(id);
         Ok(id)

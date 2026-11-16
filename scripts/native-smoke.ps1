@@ -12,7 +12,7 @@ $WorkspaceId = [guid]::NewGuid().ToString()
 $TabId = [guid]::NewGuid().ToString()
 $Profile = @{id='shell';name='PowerShell';command='powershell.exe';args=@();kind='shell'}
 $Tab = @{id=$TabId;title='PowerShell';profile=$Profile;cwd=$ProjectRoot;session_id=$null;launched=$false;rows=30;cols=100}
-$Data = @{version=1;selected_workspace=$WorkspaceId;profiles=@($Profile);workspaces=@(@{id=$WorkspaceId;name='vibe-terminal';directory=$ProjectRoot;tabs=@($Tab);selected_tab=$TabId;page='terminal'})}
+$Data = @{version=1;selected_workspace=$WorkspaceId;profiles=@($Profile);workspaces=@(@{id=$WorkspaceId;name='vibe-terminal';directory=$ProjectRoot;tabs=@($Tab);selected_tab=$TabId})}
 $Utf8 = New-Object Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $DataPath 'state.json'),($Data | ConvertTo-Json -Depth 12),$Utf8)
 [IO.File]::WriteAllText((Join-Path $DataPath "history/$TabId.ansi"),"GPUI native smoke test`r`n`r`n  src/main.rs:12`r`n  src/terminal.rs:34`r`n  .local/gpui-native/edit-me.rs:2`r`n  .local/gpui-native/window.png`r`n`r`nThis is saved history. Resume starts a real PowerShell process.`r`n",$Utf8)

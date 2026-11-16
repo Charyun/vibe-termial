@@ -1,12 +1,19 @@
+pub mod activity;
 pub mod agents;
+#[cfg(feature = "desktop")]
+pub mod clipboard;
+pub mod conversation;
+mod jsonl;
 pub mod model;
 pub mod paths;
 pub mod scroll;
 pub mod session;
+pub mod ssh;
 pub mod store;
 #[cfg(feature = "desktop")]
 pub mod tailscale;
 pub mod terminal;
+pub mod titles;
 pub mod transcript;
 #[cfg(feature = "web")]
 pub mod web;

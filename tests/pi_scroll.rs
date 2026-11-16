@@ -7,13 +7,13 @@ use std::{
 };
 use vibe_terminal::{
     model::{CliKind, CliProfile, Tab},
-    scroll::mouse_wheel_sequence,
+    scroll::{MouseButtonEvent, mouse_button_sequence, mouse_wheel_sequence},
     terminal::Terminal,
 };
 
 #[test]
 #[ignore = "requires the Pi CLI; run with an isolated PI_CODING_AGENT_DIR"]
-fn real_pi_renders_seeded_history_and_receives_forwarded_wheel() {
+fn real_pi_renders_seeded_history_and_receives_forwarded_mouse() {
     let root = std::env::temp_dir().join(format!("vibe-pi-scroll-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let session = root.join("session.jsonl");
@@ -80,7 +80,31 @@ fn real_pi_renders_seeded_history_and_receives_forwarded_wheel() {
     };
     assert_eq!(sequence, b"\x1b[<64;11;11M");
     term.send(sequence.repeat(12)).unwrap();
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_screen(&term, |text| text.contains("Jump to latest message"));
+
+    // Find Pi's actual scrollbar thumb, then drag it to both ends.
+    let (thumb_row, thumb_col) = {
+        let buffer = term.buffer.lock().unwrap();
+        let screen = buffer.parser.screen();
+        let (rows, cols) = screen.size();
+        (0..cols)
+            .rev()
+            .find_map(|col| {
+                (0..rows).find_map(|row| {
+                    screen
+                        .cell(row, col)
+                        .filter(|cell| matches!(cell.contents(), "┃" | "█"))
+                        .map(|_| (row, col))
+                })
+            })
+            .expect("Pi must render a scrollbar thumb after scrolling")
+    };
+    // Auto-hidden scrollbar must reappear on pointer hover and use the thick
+    // active thumb without requiring either a wheel event or a button press.
+    wait_for_screen(&term, |text| !text.contains('┃') && !text.contains('█'));
+    send_mouse(&term, MouseButtonEvent::Move, thumb_row, thumb_col);
+    wait_for_screen(&term, |text| text.contains('█'));
+    std::thread::sleep(Duration::from_millis(1250));
     assert!(
         term.buffer
             .lock()
@@ -88,10 +112,142 @@ fn real_pi_renders_seeded_history_and_receives_forwarded_wheel() {
             .parser
             .screen()
             .contents()
-            .contains("PI_SCROLL_"),
-        "Pi should keep showing the conversation after forwarded wheel input"
+            .contains('█'),
+        "hover must keep the scrollbar visible beyond the auto-hide delay"
     );
+    send_mouse(&term, MouseButtonEvent::Move, 30, 110);
+    wait_for_screen(&term, |text| !text.contains('┃') && !text.contains('█'));
+    send_mouse(&term, MouseButtonEvent::Move, thumb_row, thumb_col);
+    wait_for_screen(&term, |text| text.contains('█'));
+    send_mouse(&term, MouseButtonEvent::Press, thumb_row, thumb_col);
+    send_mouse(&term, MouseButtonEvent::Drag, 0, thumb_col);
+    wait_for_screen(&term, |text| text.contains("PI_SCROLL_000_000"));
+    send_mouse(&term, MouseButtonEvent::Drag, 29, thumb_col);
+    send_mouse(&term, MouseButtonEvent::Release, 29, thumb_col);
+    wait_for_screen(&term, |text| {
+        text.contains("PI_SCROLL_011_029") && !text.contains("Jump to latest message")
+    });
+
+    term.send(sequence.repeat(12)).unwrap();
+    wait_for_screen(&term, |text| text.contains("Jump to latest message"));
+    let (row, col) = {
+        let buffer = term.buffer.lock().unwrap();
+        let screen = buffer.parser.screen();
+        screen
+            .rows(0, screen.size().1)
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find("Jump to latest message").map(|offset| {
+                    (
+                        row as u16,
+                        unicode_width::UnicodeWidthStr::width(&line[..offset]) as u16,
+                    )
+                })
+            })
+            .expect("jump button must be visible")
+    };
+    send_mouse(&term, MouseButtonEvent::Press, row, col);
+    send_mouse(&term, MouseButtonEvent::Release, row, col);
+    wait_for_screen(&term, |text| {
+        text.contains("PI_SCROLL_011_029") && !text.contains("Jump to latest message")
+    });
     term.stop();
     drop(term);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "requires Pi; verifies real ConPTY cursor movement without model requests"]
+fn real_pi_caret_tracks_middle_of_input() {
+    let root = std::env::temp_dir().join(format!("vibe-pi-caret-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let session = root.join("session.jsonl");
+    fs::write(&session, format!("{}\n{}\n", json!({"type":"session","version":3,"id":uuid::Uuid::new_v4(),"timestamp":"2026-11-16T00:00:00Z","cwd":root}), json!({"type":"message","id":"seed","parentId":null,"timestamp":"2026-11-16T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"PI_CARET_FIXTURE"}],"timestamp":1794787200000u64}}))).unwrap();
+    let profile = CliProfile {
+        id: "pi-caret-test".into(),
+        name: "Pi".into(),
+        command: "pi".into(),
+        kind: CliKind::Pi,
+        args: vec![
+            "--tui-mode".into(),
+            "fullscreen".into(),
+            "--no-extensions".into(),
+            "--no-skills".into(),
+            "--no-prompt-templates".into(),
+        ],
+    };
+    let tab = Tab::new(profile, root.clone());
+    fs::rename(&session, root.join(format!("{}.jsonl", tab.id))).unwrap();
+    let mut term = Terminal::start(&tab, &root, 30, 110, Arc::new(|| {})).unwrap();
+    wait_for_screen(&term, |text| text.contains("PI_CARET_FIXTURE"));
+    term.send(b"CARET_abcdefghij".to_vec()).unwrap();
+    wait_for_screen(&term, |text| text.contains("CARET_abcdefghij"));
+    let (row, start) = {
+        let buffer = term.buffer.lock().unwrap();
+        let screen = buffer.parser.screen();
+        screen
+            .rows(0, 110)
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find("CARET_abcdefghij")
+                    .map(|col| (row as u16, col as u16))
+            })
+            .unwrap()
+    };
+    term.send(b"\x1b[D".repeat(5)).unwrap();
+    let expected = (row, start + 11);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let buffer = term.buffer.lock().unwrap();
+        let screen = buffer.parser.screen();
+        let ready = screen.cursor_position() == expected
+            || screen
+                .cell(expected.0, expected.1)
+                .is_some_and(|cell| cell.inverse());
+        drop(buffer);
+        if ready || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let actual = {
+        let buffer = term.buffer.lock().unwrap();
+        eprintln!(
+            "Pi edit cursor expected={expected:?}, ConPTY cursor={:?}, hidden={}",
+            buffer.parser.screen().cursor_position(),
+            buffer.parser.screen().hide_cursor()
+        );
+        buffer.parser.screen().cursor_position()
+    };
+    term.stop();
+    drop(term);
+    fs::remove_dir_all(root).unwrap();
+    assert_eq!(
+        actual, expected,
+        "ConPTY must preserve the edit cursor after moving left inside existing text"
+    );
+}
+
+fn send_mouse(term: &Terminal, event: MouseButtonEvent, row: u16, col: u16) {
+    let sequence = {
+        let buffer = term.buffer.lock().unwrap();
+        mouse_button_sequence(buffer.parser.screen(), event, row, col, false, false, true)
+            .expect("Pi must receive button input through ConPTY")
+    };
+    term.send(sequence).unwrap();
+}
+
+fn wait_for_screen(term: &Terminal, predicate: impl Fn(&str) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = term.buffer.lock().unwrap().parser.screen().contents();
+        if predicate(&text) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Pi screen did not reach expected state:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }

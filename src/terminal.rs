@@ -17,6 +17,9 @@ pub const SCROLLBACK: usize = 2000;
 pub struct Callbacks {
     input: Option<SyncSender<Vec<u8>>>,
     pub cwd: PathBuf,
+    pub remote: bool,
+    pub activity: crate::activity::Activity,
+    live: bool,
 }
 impl vt100::Callbacks for Callbacks {
     fn unhandled_csi(
@@ -27,6 +30,9 @@ impl vt100::Callbacks for Callbacks {
         params: &[&[u16]],
         c: char,
     ) {
+        if !self.live {
+            return;
+        }
         let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         let reply = match (i1, c, first) {
             (None, 'n', 6) => {
@@ -43,6 +49,27 @@ impl vt100::Callbacks for Callbacks {
         }
     }
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first().copied() == Some(b"7501") {
+            if !self.live || params.len() != 2 {
+                return;
+            }
+            if let Some(body) = params
+                .get(1)
+                .and_then(|body| std::str::from_utf8(body).ok())
+            {
+                if body.trim() == "?" {
+                    if let Some(input) = &self.input {
+                        let _ = input.try_send(crate::activity::QUERY_REPLY.to_vec());
+                    }
+                } else {
+                    self.activity.osc(body);
+                }
+            }
+            return;
+        }
+        if self.remote {
+            return;
+        }
         if params.first().copied() == Some(b"7") {
             if let Some(value) = params.get(1).and_then(|v| std::str::from_utf8(v).ok()) {
                 if let Ok(url) = url::Url::parse(value) {
@@ -57,6 +84,7 @@ impl vt100::Callbacks for Callbacks {
 
 pub struct Buffer {
     pub parser: vt100::Parser<Callbacks>,
+    pub runtime_id: uuid::Uuid,
     pub revision: u64,
     #[cfg(feature = "web")]
     pub output: tokio::sync::broadcast::Sender<crate::web::Output>,
@@ -68,8 +96,15 @@ impl Buffer {
                 rows,
                 cols,
                 SCROLLBACK,
-                Callbacks { input: None, cwd },
+                Callbacks {
+                    input: None,
+                    cwd,
+                    remote: false,
+                    activity: crate::activity::Activity::default(),
+                    live: true,
+                },
             ),
+            runtime_id: uuid::Uuid::new_v4(),
             revision: 0,
             #[cfg(feature = "web")]
             output: tokio::sync::broadcast::channel(256).0,
@@ -82,7 +117,10 @@ impl Buffer {
         let _ = self.output.send(crate::web::Output::Data(data.to_vec()));
     }
     pub fn replay(&mut self, bytes: &[u8]) {
+        let live = self.parser.callbacks().live;
+        self.parser.callbacks_mut().live = false;
         self.parser.process(bytes);
+        self.parser.callbacks_mut().live = live;
         self.revision += 1;
         // History is display-only. It is not fed to the new CLI process.
     }
@@ -176,6 +214,7 @@ impl Terminal {
         if !tab.cwd.is_dir() {
             bail!("项目目录不存在：{}", tab.cwd.display());
         }
+        let runtime_id = uuid::Uuid::new_v4();
         let mut args = tab.launch_args(sessions)?;
         if tab.profile.kind == CliKind::Codex {
             let callback = vec![
@@ -183,6 +222,9 @@ impl Terminal {
                 "--record-codex-session".into(),
                 sessions
                     .join(format!("{}.codex.json", tab.id))
+                    .to_string_lossy()
+                    .into_owned(),
+                crate::activity::completion_path(sessions, tab.id, runtime_id)
                     .to_string_lossy()
                     .into_owned(),
             ];
@@ -202,6 +244,15 @@ impl Terminal {
         cmd.cwd(crate::paths::local_path(&tab.cwd));
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        if tab.profile.kind == CliKind::Pi {
+            cmd.env("PI_PROGRAM_STATUS", "1");
+        }
+        #[cfg(windows)]
+        if tab.profile.kind == CliKind::Pi {
+            // ConPTY drops hidden cursor positioning: the external parser
+            // otherwise stays at the last repainted row's end, breaking IME.
+            cmd.env("PI_HARDWARE_CURSOR", "1");
+        }
         // Enable OSC 7 directory updates for the managed default shells without changing user profiles.
         if tab.profile.kind == CliKind::Shell && args.is_empty() {
             #[cfg(windows)]
@@ -254,6 +305,7 @@ impl Terminal {
         };
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(128);
         let mut buffer = Buffer::new(rows, cols, tab.cwd.clone());
+        buffer.runtime_id = runtime_id;
         buffer.parser.callbacks_mut().input = Some(tx.clone());
         let shared = Arc::new(Mutex::new(buffer));
         // A new frontend has not consumed a frame yet. The first output chunk must wake it.
@@ -311,6 +363,37 @@ impl Terminal {
             job,
         })
     }
+    pub fn start_ssh(
+        tab: &Tab,
+        sessions: &Path,
+        host: &crate::ssh::SshHost,
+        project: &crate::ssh::SshProject,
+        rows: u16,
+        cols: u16,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self> {
+        let mut proxy = tab.clone();
+        let mut args = host.args(true)?;
+        args.push(crate::ssh::launch_command(tab, project)?);
+        proxy.cwd = sessions.parent().context("本地会话目录无效")?.to_path_buf();
+        proxy.profile = crate::model::CliProfile {
+            id: "ssh-transport".into(),
+            name: format!("SSH · {}", host.name),
+            command: "ssh".into(),
+            args,
+            kind: CliKind::Shell,
+        };
+        let term = Self::start(&proxy, sessions, rows, cols, wake)?;
+        term.mark_remote(PathBuf::from(&project.path));
+        Ok(term)
+    }
+    pub fn mark_remote(&self, path: PathBuf) {
+        if let Ok(mut buffer) = self.buffer.lock() {
+            buffer.parser.callbacks_mut().remote = true;
+            buffer.parser.callbacks_mut().cwd = path;
+            buffer.revision = buffer.revision.wrapping_add(1);
+        }
+    }
     pub fn running(&self) -> bool {
         self.child.is_some() && !self.ended.load(Ordering::Acquire)
     }
@@ -341,6 +424,13 @@ impl Terminal {
         })
     }
     pub fn update_cwd(&self) {
+        if self
+            .buffer
+            .lock()
+            .is_ok_and(|buffer| buffer.parser.callbacks().remote)
+        {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(pid) = self.child.as_ref().and_then(|c| c.process_id()) {
             unsafe {

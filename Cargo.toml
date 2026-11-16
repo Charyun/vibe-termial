@@ -7,7 +7,7 @@ license = "MIT"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:gpui-kit", "dep:async-channel", "dep:smol", "dep:image", "web"]
+desktop = ["dep:gpui-kit", "dep:async-channel", "dep:smol", "dep:image", "dep:wry", "dep:raw-window-handle", "web"]
 web = ["dep:axum", "dep:tokio"]
 
 [[bin]]
@@ -42,7 +42,12 @@ tokio-tungstenite = "=0.29.0"
 futures-util = "0.3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem"] }
+raw-window-handle = { version = "0.6", optional = true }
+wry = { version = "=0.57.1", optional = true, default-features = false, features = ["os-webview", "devtools"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres = "=0.3.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

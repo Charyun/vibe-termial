@@ -39,6 +39,9 @@ impl Store {
         }
         // 旧记录可能保存了 `\\?\` 前缀，读取时统一规范化，避免终端启动落在错误目录。
         for workspace in &mut data.workspaces {
+            if workspace.remote.is_some() {
+                continue;
+            }
             workspace.directory = crate::paths::local_path(&workspace.directory);
             for tab in &mut workspace.tabs {
                 tab.cwd = crate::paths::local_path(&tab.cwd);
@@ -62,6 +65,24 @@ impl Store {
         atomic_write(
             &self.root.join("state.json"),
             &serde_json::to_vec_pretty(data)?,
+        )
+    }
+    pub fn save_failed_restore(
+        &self,
+        workspace: &crate::model::Workspace,
+        tab: &crate::model::Tab,
+    ) -> Result<()> {
+        let directory = self.root.join("failed-restores");
+        fs::create_dir_all(&directory)?;
+        atomic_write(
+            &directory.join(format!("{}.json", tab.id)),
+            &serde_json::to_vec_pretty(&serde_json::json!({
+                "workspace_id": workspace.id,
+                "workspace_name": workspace.name,
+                "directory": workspace.directory,
+                "remote": workspace.remote,
+                "tab": tab,
+            }))?,
         )
     }
     pub fn save_history(&self, id: Uuid, bytes: &[u8]) -> Result<()> {

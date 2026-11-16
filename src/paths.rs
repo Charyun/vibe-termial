@@ -14,55 +14,111 @@ pub struct FileLink {
     pub column: Option<usize>,
 }
 
-pub fn find_links(text: &str, cwd: &Path, workspace: &Path) -> Vec<FileLink> {
-    static TOKENS: OnceLock<Regex> = OnceLock::new();
-    let re = TOKENS.get_or_init(|| {
-        Regex::new(r#"(?:"[^"\r\n]+"|'[^'\r\n]+'|`[^`\r\n]+`)(?::\d+(?::\d+)?)?|[^\s<>"'`|]+"#)
-            .expect("static path regex")
-    });
-    let mut found = vec![];
-    for m in re.find_iter(text) {
-        let raw = m.as_str();
-        let cleaned =
-            raw.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'));
-        let cleaned = cleaned.strip_suffix('.').unwrap_or(cleaned);
-        let offset = raw.find(cleaned).unwrap_or(0);
-        let (base, line, column) = split_location(cleaned);
-        let base = base.trim_matches(['"', '\'', '`']);
-        if base.is_empty() || base.contains("://") {
-            continue;
-        }
-        let expanded = if let Some(rest) = base.strip_prefix("~/") {
-            directories::BaseDirs::new().map(|b| b.home_dir().join(rest))
-        } else {
-            Some(PathBuf::from(base))
-        };
-        let Some(input) = expanded else {
-            continue;
-        };
-        let path = if input.is_absolute() {
-            input
-        } else {
-            let candidate = cwd.join(&input);
-            if candidate.is_file() {
-                candidate
-            } else {
-                workspace.join(input)
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebLink {
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+}
+
+pub fn is_web_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
+/// Terminal cell offsets, including wide characters. Keep balanced URL parentheses.
+pub fn find_web_links(text: &str) -> Vec<WebLink> {
+    static URLS: OnceLock<Regex> = OnceLock::new();
+    let re = URLS.get_or_init(|| Regex::new(r#"https?://[^\s<>\"'`]+"#).unwrap());
+    re.find_iter(text)
+        .filter_map(|m| {
+            let mut value = m
+                .as_str()
+                .trim_end_matches(['.', ',', ';', '!', '。', '，', '；', '！', '）', '】', '》']);
+            for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+                while value.ends_with(close)
+                    && value.matches(close).count() > value.matches(open).count()
+                {
+                    value = &value[..value.len() - close.len_utf8()];
+                }
             }
-        };
-        if !path.is_file() {
-            continue;
-        }
-        let byte_start = m.start() + offset;
-        found.push(FileLink {
-            start: text[..byte_start].width(),
-            end: text[..byte_start + cleaned.len()].width(),
-            path,
-            line,
-            column,
-        });
+            is_web_url(value).then(|| WebLink {
+                start: text[..m.start()].width(),
+                end: text[..m.start() + value.len()].width(),
+                url: value.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// A resolver belongs to one captured frame. Deduplicate filesystem probes across
+/// all visible rows, but never carry positive or negative results into a new frame.
+#[derive(Default)]
+pub struct FileLinkResolver {
+    files: std::collections::HashMap<PathBuf, bool>,
+}
+impl FileLinkResolver {
+    fn is_file(&mut self, path: &Path) -> bool {
+        *self
+            .files
+            .entry(path.to_owned())
+            .or_insert_with(|| path.is_file())
     }
-    found
+
+    pub fn find(&mut self, text: &str, cwd: &Path, workspace: &Path) -> Vec<FileLink> {
+        static TOKENS: OnceLock<Regex> = OnceLock::new();
+        let re = TOKENS.get_or_init(|| {
+            Regex::new(r#"(?:"[^"\r\n]+"|'[^'\r\n]+'|`[^`\r\n]+`)(?::\d+(?::\d+)?)?|[^\s<>"'`|]+"#)
+                .expect("static path regex")
+        });
+        let mut found = vec![];
+        for m in re.find_iter(text) {
+            let raw = m.as_str();
+            let cleaned = raw
+                .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'));
+            let cleaned = cleaned.strip_suffix('.').unwrap_or(cleaned);
+            let offset = raw.find(cleaned).unwrap_or(0);
+            let (base, line, column) = split_location(cleaned);
+            let base = base.trim_matches(['"', '\'', '`']);
+            if base.is_empty() || base.contains("://") {
+                continue;
+            }
+            let expanded = if let Some(rest) = base.strip_prefix("~/") {
+                directories::BaseDirs::new().map(|b| b.home_dir().join(rest))
+            } else {
+                Some(PathBuf::from(base))
+            };
+            let Some(input) = expanded else {
+                continue;
+            };
+            let path = if input.is_absolute() {
+                input
+            } else {
+                let candidate = cwd.join(&input);
+                if self.is_file(&candidate) {
+                    candidate
+                } else {
+                    workspace.join(input)
+                }
+            };
+            if !self.is_file(&path) {
+                continue;
+            }
+            let byte_start = m.start() + offset;
+            found.push(FileLink {
+                start: text[..byte_start].width(),
+                end: text[..byte_start + cleaned.len()].width(),
+                path,
+                line,
+                column,
+            });
+        }
+        found
+    }
+}
+
+pub fn find_links(text: &str, cwd: &Path, workspace: &Path) -> Vec<FileLink> {
+    FileLinkResolver::default().find(text, cwd, workspace)
 }
 
 fn split_location(token: &str) -> (&str, Option<usize>, Option<usize>) {
@@ -217,6 +273,60 @@ pub fn local_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frame_resolver_deduplicates_paths_without_caching_across_frames() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("sample.rs");
+        std::fs::write(&file, "test").unwrap();
+        let mut resolver = FileLinkResolver::default();
+        for _ in 0..100 {
+            let links = resolver.find("sample.rs:12:3 sample.rs:20", &root, &root);
+            assert_eq!(links.len(), 2);
+            assert_eq!(links[0].line, Some(12));
+            assert_eq!(links[1].line, Some(20));
+        }
+        // Relative-candidate and final validation share one actual filesystem probe.
+        assert_eq!(resolver.files.len(), 1);
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            FileLinkResolver::default()
+                .find("sample.rs", &root, &root)
+                .is_empty()
+        );
+        assert!(find_links("new.rs", &root, &root).is_empty());
+        std::fs::write(root.join("new.rs"), "new").unwrap();
+        assert_eq!(find_links("new.rs", &root, &root).len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn frame_resolver_keeps_cwd_precedence_and_workspace_fallback() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let cwd = root.join("nested");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(root.join("shared.rs"), "workspace").unwrap();
+        std::fs::write(cwd.join("shared.rs"), "cwd").unwrap();
+        std::fs::write(root.join("fallback.rs"), "workspace").unwrap();
+        let links = FileLinkResolver::default().find("shared.rs fallback.rs", &cwd, &root);
+        assert_eq!(links[0].path, cwd.join("shared.rs"));
+        assert_eq!(links[1].path, root.join("fallback.rs"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn web_links_preserve_ports_queries_fragments_and_balanced_parentheses() {
+        let text = "网页 (http://localhost:3000/path?q=1#part), https://example.org/wiki/A_(B).";
+        let links = find_web_links(text);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].start, 6);
+        assert_eq!(links[0].url, "http://localhost:3000/path?q=1#part");
+        assert_eq!(links[0].end - links[0].start, links[0].url.len());
+        assert_eq!(links[1].url, "https://example.org/wiki/A_(B)");
+        assert!(find_web_links("file:///tmp/test javascript:alert(1) http://").is_empty());
+        assert!(is_web_url("http://[::1]:8080/"));
+        assert!(!is_web_url("file:///tmp/test"));
+    }
     #[test]
     fn locations_preserve_windows_drive_colon() {
         assert_eq!(

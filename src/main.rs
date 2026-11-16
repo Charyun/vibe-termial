@@ -1,5 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 extern crate gpui_kit as gpui;
+mod appearance;
+mod assets;
+mod browser;
+mod project;
 mod render;
 mod ui;
 
@@ -21,10 +25,10 @@ fn run() -> Result<()> {
     if args.first().is_some_and(|s| s == "--record-codex-session") {
         let path = std::path::PathBuf::from(args.get(1).context("missing session marker path")?);
         let payload = args
-            .get(2)
+            .last()
             .context("missing Codex notification payload")?
             .to_string_lossy();
-        if payload.len() > 16384 {
+        if payload.len() > 1024 * 1024 {
             bail!("notification too large");
         }
         let value: serde_json::Value = serde_json::from_str(&payload)?;
@@ -38,6 +42,15 @@ fn run() -> Result<()> {
             &path,
             &serde_json::to_vec(&serde_json::json!({"thread-id":id}))?,
         )?;
+        if args.len() >= 4
+            && value.get("type").and_then(|value| value.as_str()) == Some("agent-turn-complete")
+        {
+            let activity_path = std::path::PathBuf::from(&args[2]);
+            atomic_write(
+                &activity_path,
+                &serde_json::to_vec(&serde_json::json!({"event-id": uuid::Uuid::new_v4()}))?,
+            )?;
+        }
         return Ok(());
     }
     let store = Store::open()?;
@@ -51,13 +64,16 @@ fn run() -> Result<()> {
     let data = store.load()?;
     let session = vibe_terminal::session::Session::new(store, data, Some(lock));
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.set_app_identity("dev.vibe.terminal", "Vibe Terminal");
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
             gpui_kit::component::Theme::update(cx, |theme| {
                 theme.font_family = "Geist".into();
                 theme.mono_font_family = "Geist Mono".into();
+                theme.secondary_hover = rgb(0x414c45).into();
+                theme.secondary_active = rgb(0x587360).into();
             });
             if let Err(e) = cx.text_system().add_fonts(vec![
                 Cow::Borrowed(include_bytes!("../assets/fonts/Geist.ttf")),
@@ -71,8 +87,9 @@ fn run() -> Result<()> {
                 window_min_size: Some(size(px(900.0), px(560.0))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Vibe Terminal".into()),
-                    ..Default::default()
+                    ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
+                app_owns_titlebar_drag: true,
                 ..Default::default()
             };
             match gpui_kit::open_window(options, cx, move |window, cx| {

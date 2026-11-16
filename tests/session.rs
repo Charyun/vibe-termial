@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 use uuid::Uuid;
 use vibe_terminal::{
-    model::{AppData, CliProfile, Tab, WorkspacePage},
+    model::{AppData, CliProfile, InputCursorStyle, Tab},
     session::Session,
     store::Store,
 };
@@ -16,19 +16,44 @@ fn setup() -> (PathBuf, Store, AppData) {
     (root, store, data)
 }
 #[test]
-fn old_workspace_records_load_as_terminal_pages() {
+fn general_cursor_style_defaults_to_block_and_persists_both_choices() {
+    let (root, store, data) = setup();
+    let mut legacy = serde_json::to_value(data).unwrap();
+    legacy.as_object_mut().unwrap().remove("input_cursor_style");
+    let mut restored: AppData = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.input_cursor_style, InputCursorStyle::Block);
+    for style in [InputCursorStyle::Bar, InputCursorStyle::Block] {
+        restored.input_cursor_style = style;
+        store.save(&restored).unwrap();
+        assert_eq!(store.load().unwrap().input_cursor_style, style);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_page_fields_are_ignored_without_losing_workspace_selection() {
     let (root, _store, data) = setup();
-    let mut value = serde_json::to_value(data).unwrap();
-    value["workspaces"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("page");
-    let restored: AppData = serde_json::from_value(value).unwrap();
-    assert_eq!(restored.workspaces[0].page, WorkspacePage::Terminal);
+    for page in [None, Some("overview"), Some("terminal")] {
+        let mut value = serde_json::to_value(&data).unwrap();
+        if let Some(page) = page {
+            value["workspaces"][0]["page"] = page.into();
+        }
+        let restored: AppData = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.selected_workspace, data.selected_workspace);
+        assert_eq!(
+            restored.workspaces[0].directory,
+            data.workspaces[0].directory
+        );
+        assert!(
+            serde_json::to_value(restored).unwrap()["workspaces"][0]
+                .get("page")
+                .is_none()
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
-fn workspace_pages_and_terminal_history_are_loaded_on_demand() {
+fn terminal_history_is_loaded_on_demand_and_last_tab_can_close() {
     let (root, store, mut data) = setup();
     let p = CliProfile::defaults().remove(0);
     let first = Tab::new(p.clone(), root.clone());
@@ -57,8 +82,12 @@ fn workspace_pages_and_terminal_history_are_loaded_on_demand() {
     session.select_tab(b);
     assert_eq!(session.terminals.len(), 1);
     assert!(!session.terminals.contains_key(&a));
-    session.overview();
-    assert_eq!(session.page(), WorkspacePage::Overview);
+    session.close_tab(b);
+    assert_eq!(session.selected(), Some(a));
+    session.close_tab(a);
+    assert_eq!(session.selected(), None);
+    assert!(session.data.workspace().unwrap().tabs.is_empty());
+    assert!(session.terminals.is_empty());
     drop(session);
     fs::remove_dir_all(root).unwrap();
 }

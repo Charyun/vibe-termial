@@ -1,16 +1,30 @@
+#[cfg(test)]
+mod acceptance;
+mod activity;
+mod chrome;
+mod clipboard;
+mod conversation;
+mod documents;
+mod panels;
+mod ssh;
+use crate::appearance::{control_icon, icon, profile_icon, profile_icon_sized};
 use crate::render::{self, CELL, INSET, LINE, Snapshot};
 use anyhow::{Result, bail};
 use gpui_kit::{
     component::{
-        IconName, Sizable,
+        Disableable, Selectable, Sizable,
         button::*,
         input::{Editor as CodeEditor, EditorState, Input, InputEvent, InputState, Position},
     },
     *,
 };
+use panels::{PanelTab, ProjectPanel};
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     ops::Range,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,7 +33,7 @@ use std::{
 };
 use uuid::Uuid;
 use vibe_terminal::{
-    model::{CliKind, CliProfile, WorkspacePage},
+    model::{CliKind, CliProfile, InputCursorStyle},
     paths::{FileLink, Preview},
     scroll::WheelAccumulator,
     session::Session,
@@ -28,9 +42,10 @@ use vibe_terminal::{
 const BG: u32 = 0x181818;
 const PANEL: u32 = 0x1f1f1f;
 const SURFACE: u32 = 0x272727;
-const FG: u32 = 0xdddddf;
-const MUTED: u32 = 0x929297;
-const ACCENT: u32 = 0xa8d5a2;
+const FG: u32 = 0xe6e7e6;
+const MUTED: u32 = 0x90978f;
+const ACCENT: u32 = 0xb4edc5;
+const SIDEBAR_WIDTH: f32 = 224.0;
 
 type CellPoint = (usize, usize);
 #[derive(Clone)]
@@ -44,10 +59,16 @@ enum Dialog {
 #[derive(Clone)]
 enum PreviewAction {
     Close,
+    CloseDocument(Uuid),
     File(FileLink),
-    Image(PathBuf),
+    Web(String),
     Workspace(Uuid),
     AddWorkspace(PathBuf),
+    AddRemoteWorkspace {
+        host_id: Uuid,
+        path: String,
+        name: String,
+    },
     RemoveWorkspace(Uuid),
     Quit,
 }
@@ -57,6 +78,12 @@ enum Editor {
 enum PreviewContent {
     Code(CodePreview),
     Image(PathBuf),
+    Web(WebPreview),
+}
+struct WebPreview {
+    id: Uuid,
+    url: String,
+    error: Option<String>,
 }
 struct CodePreview {
     file: Preview,
@@ -64,44 +91,79 @@ struct CodePreview {
 
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
+    General,
     Agents,
     Shortcuts,
     Remote,
+    SshHosts,
 }
 impl SettingsTab {
     fn title(self) -> &'static str {
         match self {
+            Self::General => "General",
             Self::Agents => "Agent",
             Self::Shortcuts => "快捷键",
             Self::Remote => "Remote",
+            Self::SshHosts => "SSH 主机",
         }
     }
 }
 enum Event {
     Output,
+    SshProbe(Uuid, Uuid, Result<String>),
     Preview(Uuid, Result<PreviewContent>),
+    Document(Uuid, Uuid, Result<documents::DocumentContent>),
+    ClipboardImage(
+        vibe_terminal::clipboard::PasteTarget,
+        clipboard::PasteDestination,
+        Result<PathBuf>,
+    ),
     Web(vibe_terminal::web::Request),
     TailscaleAddress(Result<String>),
+    BrowserNavigated(Uuid, String),
+    BrowserError(Uuid, String),
+    BrowserReady(Uuid),
+    Directory(Uuid, PathBuf, Result<crate::project::Directory>),
+    Changes(Uuid, Result<crate::project::Changes>),
+    Diff(Uuid, Result<crate::project::Diff>),
 }
 
 pub struct Ui {
     pub session: Session,
     focus: FocusHandle,
     snapshot: Arc<Snapshot>,
+    snapshot_cache: render::SnapshotCache,
+    text_cache: RefCell<render::TextCache>,
+    running_terminals: std::collections::HashSet<Uuid>,
+    agent_activity: HashMap<Uuid, vibe_terminal::activity::Indicator>,
     bounds: Bounds<Pixels>,
     selection: Option<(CellPoint, CellPoint)>,
     selecting: bool,
+    mouse_capture: Option<(Uuid, CellPoint)>,
+    mouse_hover: Option<(Uuid, CellPoint)>,
+    terminal_pointer: Option<Point<Pixels>>,
     path_press: Option<(CellPoint, Point<Pixels>)>,
     preedit: String,
+    last_ime_geometry: Option<(Bounds<Pixels>, f32)>,
     settings: bool,
     settings_tab: SettingsTab,
     expanded_workspaces: Vec<Uuid>,
-    transcript: Option<vibe_terminal::transcript::Transcript>,
+    conversations: HashMap<Uuid, conversation::ConversationView>,
+    documents: Vec<documents::DocumentTab>,
+    native_images: HashMap<Uuid, vibe_terminal::clipboard::PasteTarget>,
+    active_document: Option<Uuid>,
+    pending_document: Option<Uuid>,
     detected_agents: Vec<vibe_terminal::agents::Detected>,
     wheel: WheelAccumulator,
     dialog: Option<Dialog>,
     editor: Option<Editor>,
     preview: Option<PreviewContent>,
+    split_preview_owner: Option<Uuid>,
+    terminal_preview_width: f32,
+    resizing_terminal_preview: bool,
+    panel: ProjectPanel,
+    ssh: ssh::SshUi,
+    browser: Rc<RefCell<crate::browser::Browser>>,
     preview_request: Option<Uuid>,
     preview_editor: Option<Entity<EditorState>>,
     preview_subscription: Option<Subscription>,
@@ -120,9 +182,7 @@ pub struct Ui {
 }
 impl Ui {
     pub fn new(mut session: Session, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        if session.page() == WorkspacePage::Terminal {
-            session.ensure_history();
-        }
+        session.ensure_history();
         let (sender, receiver) = async_channel::bounded(64);
         let queued = Arc::new(AtomicBool::new(false));
         let wake_sender = sender.clone();
@@ -144,8 +204,19 @@ impl Ui {
                     .update_in(cx, |ui, window, cx| {
                         match event {
                             Event::Output => {
+                                // Always drain every flag, even when only a hidden PTY changed.
                                 ui.session.take_dirty();
-                                ui.refresh();
+                                let changed = ui.refresh_snapshot(false);
+                                let running = ui.session.terminals.iter()
+                                    .filter(|(_, terminal)| terminal.running())
+                                    .map(|(id, _)| *id)
+                                    .collect();
+                                let status_changed = ui.running_terminals != running;
+                                ui.running_terminals = running;
+                                let activity_changed = ui.refresh_agent_activity();
+                                if !changed && !status_changed && !activity_changed {
+                                    return;
+                                }
                             }
                             Event::Web(request) => {
                                 if !request.reply.is_closed() {
@@ -164,6 +235,31 @@ impl Ui {
                                         Some(format!("Tailscale 地址获取失败：{error:#}"))
                                 }
                             },
+                            Event::SshProbe(request,host,result) => ui.accept_ssh_probe(request,host,result),
+                            Event::Directory(id, path, result) => ui.accept_directory(id, path, result),
+                            Event::ClipboardImage(target, destination, result) => ui.accept_clipboard_image(target, destination, result, window, cx),
+                            Event::Document(id, request, result) => ui.accept_document(id, request, result, window, cx),
+                            Event::Changes(id, result) => ui.accept_changes(id, result),
+                            Event::Diff(id, result) => ui.accept_diff(id, result),
+                            Event::BrowserNavigated(id, url) => {
+                                if let Some(PreviewContent::Web(web)) = &mut ui.preview
+                                    && web.id == id
+                                {
+                                    web.url = url;
+                                }
+                            }
+                            Event::BrowserReady(id) => {
+                                if !matches!(&ui.preview, Some(PreviewContent::Web(web)) if web.id == id) {
+                                    return;
+                                }
+                            }
+                            Event::BrowserError(id, error) => {
+                                if let Some(PreviewContent::Web(web)) = &mut ui.preview
+                                    && web.id == id
+                                {
+                                    web.error = Some(error);
+                                }
+                            }
                             Event::Preview(id, result) if ui.preview_request == Some(id) => {
                                 ui.preview_request = None;
                                 match result {
@@ -206,27 +302,91 @@ impl Ui {
                 }
             }
         });
+        let title_root = session.store.root.clone();
+        let titles = cx.spawn(async move |weak, cx| {
+            let mut tracker = vibe_terminal::titles::TitleTracker::default();
+            loop {
+                let Ok(tabs) = weak.update(cx, |ui, _| {
+                    ui.session
+                        .data
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| &workspace.tabs)
+                        .filter(|tab| !ui.demo && tab.accepts_session_summary())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                }) else {
+                    break;
+                };
+                let root = title_root.clone();
+                let (next, updates) = smol::unblock(move || {
+                    let updates = tracker.refresh(&tabs, &root);
+                    (tracker, updates)
+                })
+                .await;
+                tracker = next;
+                if weak
+                    .update(cx, |ui, cx| {
+                        let mut changed = false;
+                        for update in updates {
+                            if let Some(tab) = ui.session.data.tab_mut(update.tab_id) {
+                                changed |= update.apply(tab);
+                            }
+                        }
+                        if changed {
+                            ui.session.persist();
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                smol::Timer::after(Duration::from_secs(3)).await;
+            }
+        });
+        let conversations = Self::spawn_conversation_reader(cx);
+        let activity = Self::spawn_agent_activity_reader(cx);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let expanded_workspaces = session.data.workspaces.iter().map(|w| w.id).collect();
         let mut ui = Self {
             session,
             focus,
             snapshot: Arc::default(),
+            snapshot_cache: render::SnapshotCache::default(),
+            text_cache: RefCell::default(),
+            running_terminals: std::collections::HashSet::new(),
+            agent_activity: HashMap::new(),
             bounds: Bounds::default(),
             selection: None,
             selecting: false,
+            mouse_capture: None,
+            mouse_hover: None,
+            terminal_pointer: None,
             path_press: None,
             preedit: String::new(),
+            last_ime_geometry: None,
             settings: false,
-            settings_tab: SettingsTab::Agents,
-            expanded_workspaces: Vec::new(),
-            transcript: None,
+            settings_tab: SettingsTab::General,
+            expanded_workspaces,
+            conversations: HashMap::new(),
+            documents: vec![],
+            native_images: HashMap::new(),
+            active_document: None,
+            pending_document: None,
             detected_agents: Vec::new(),
             new_menu: None,
             wheel: WheelAccumulator::default(),
             dialog: None,
             editor: None,
             preview: None,
+            split_preview_owner: None,
+            terminal_preview_width: 360.0,
+            resizing_terminal_preview: false,
+            panel: ProjectPanel::default(),
+            ssh: ssh::SshUi::default(),
+            browser: Rc::new(RefCell::new(crate::browser::Browser::new())),
             preview_request: None,
             preview_editor: None,
             preview_subscription: None,
@@ -239,7 +399,7 @@ impl Ui {
             sender,
             web_server: None,
             web_tailscale: None,
-            _tasks: vec![events, checkpoint],
+            _tasks: vec![events, checkpoint, titles, conversations, activity],
             demo: false,
         };
         ui.refresh();
@@ -251,7 +411,7 @@ impl Ui {
                 .get(&id)
                 .is_some_and(|terminal| terminal.running())
         {
-            ui.session.start(id);
+            ui.session.restore(id);
             ui.refresh();
         }
         ui
@@ -318,18 +478,38 @@ impl Ui {
         .detach();
     }
     fn refresh(&mut self) {
+        self.refresh_agent_activity();
+        self.native_images
+            .retain(|_, target| self.session.paste_target_current(target));
+        // Explicit UI actions revalidate links, including files created or deleted
+        // without new terminal output. Only output-triggered refreshes may reuse a frame.
+        self.refresh_snapshot(true);
+    }
+    fn refresh_snapshot(&mut self, force: bool) -> bool {
         if let (Some(t), Some(w)) = (
             self.session
                 .selected()
                 .and_then(|id| self.session.terminals.get(&id)),
             self.session.data.workspace(),
         ) {
-            if let Ok(b) = t.buffer.lock() {
-                self.snapshot = Arc::new(Snapshot::read(&b, &w.directory));
-                return;
+            let frame = {
+                if let Ok(b) = t.buffer.lock() {
+                    self.snapshot_cache
+                        .capture(t.instance, &b, &w.directory, force)
+                } else {
+                    self.snapshot = Arc::default();
+                    return self.snapshot_cache.clear();
+                }
+            };
+            if let Some(frame) = frame {
+                // Filesystem probes happen after the PTY buffer guard has dropped.
+                self.snapshot = Arc::new(frame.resolve_links(&w.directory));
+                return true;
             }
+            return false;
         }
         self.snapshot = Arc::default();
+        self.snapshot_cache.clear()
     }
     fn install_preview(
         &mut self,
@@ -413,7 +593,10 @@ impl Ui {
         }
     }
     fn clear_preview(&mut self) {
+        self.browser.borrow_mut().hide();
+        self.browser = Rc::new(RefCell::new(crate::browser::Browser::new()));
         self.preview = None;
+        self.split_preview_owner = None;
         self.preview_request = None;
         self.preview_editor = None;
         self.preview_subscription = None;
@@ -427,6 +610,7 @@ impl Ui {
         cx: &mut Context<Self>,
     ) {
         if self.preview_dirty {
+            self.pending_document = None;
             self.pending_preview = Some(action);
             self.open_dialog(Dialog::UnsavedPreview, window, cx);
         } else {
@@ -442,40 +626,100 @@ impl Ui {
         match action {
             PreviewAction::Close => {
                 self.clear_preview();
-                self.focus.focus(window, cx);
+                self.focus_current_view(window, cx);
             }
+            PreviewAction::CloseDocument(id) => self.close_document(id, window, cx),
             PreviewAction::File(link) => {
                 self.clear_preview();
+                self.split_preview_owner = self.session.selected();
                 self.open_file(link);
             }
-            PreviewAction::Image(path) => {
+            PreviewAction::Web(url) => {
+                self.panel.open = true;
+                self.panel.tab = PanelTab::Explorer;
                 self.clear_preview();
-                self.load_image(path);
+                if vibe_terminal::paths::is_web_url(&url) {
+                    self.preview = Some(PreviewContent::Web(WebPreview {
+                        id: Uuid::new_v4(),
+                        url,
+                        error: None,
+                    }));
+                }
             }
             PreviewAction::Workspace(id) => {
                 self.clear_preview();
                 self.select_workspace(id);
+                self.focus_current_view(window, cx);
+            }
+            PreviewAction::AddRemoteWorkspace {
+                host_id,
+                path,
+                name,
+            } => {
+                self.clear_preview();
+                match self.session.add_remote_workspace(host_id, path, name) {
+                    Ok(id) => {
+                        if !self.expanded_workspaces.contains(&id) {
+                            self.expanded_workspaces.push(id);
+                        }
+                    }
+                    Err(error) => self.session.error = Some(error.to_string()),
+                }
+                self.settings = false;
+                self.active_document = None;
+                self.refresh();
+                self.focus.focus(window, cx);
             }
             PreviewAction::AddWorkspace(path) => {
+                self.active_document = None;
                 self.clear_preview();
                 self.session.add_workspace(&path);
                 self.refresh();
             }
             PreviewAction::RemoveWorkspace(id) => {
+                if self.guard_dirty_documents(
+                    Some(id),
+                    PreviewAction::RemoveWorkspace(id),
+                    window,
+                    cx,
+                ) {
+                    return;
+                }
+                self.documents.retain(|tab| tab.workspace != id);
+                if self
+                    .active_document
+                    .is_some_and(|id| !self.documents.iter().any(|tab| tab.id == id))
+                {
+                    self.active_document = None;
+                }
                 self.clear_preview();
                 self.session.remove_workspace(id);
                 self.refresh();
             }
-            PreviewAction::Quit => cx.quit(),
+            PreviewAction::Quit => {
+                if self.confirm_window_close(window, cx) {
+                    cx.quit();
+                }
+            }
         }
         cx.notify();
     }
     fn finish_pending_preview(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if save && !self.save_preview(cx) {
-            return;
+        if let Some(id) = self.pending_document {
+            if save && !self.save_document(id, cx) {
+                return;
+            }
+            if let Some(tab) = self.documents.iter_mut().find(|tab| tab.id == id) {
+                tab.dirty = false;
+            }
+            self.pending_document = None;
+        } else {
+            if save && !self.save_preview(cx) {
+                return;
+            }
+            self.preview_dirty = false;
         }
         let action = self.pending_preview.take();
-        self.preview_dirty = false;
         self.close_dialog(window, cx);
         if let Some(action) = action {
             self.perform_preview_action(action, window, cx);
@@ -489,10 +733,12 @@ impl Ui {
             self.request_preview_action(PreviewAction::Quit, window, cx);
             false
         } else {
-            true
+            !self.guard_dirty_documents(None, PreviewAction::Quit, window, cx)
         }
     }
     fn select_workspace(&mut self, id: Uuid) {
+        self.active_document = None;
+        self.clear_mouse_hover();
         self.settings = false;
         self.editor = None;
         self.wheel.reset();
@@ -504,6 +750,8 @@ impl Ui {
         self.refresh();
     }
     fn select_tab(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_document = None;
+        self.clear_mouse_hover();
         self.wheel.reset();
         self.session.select_tab(id);
         self.selection = None;
@@ -515,10 +763,10 @@ impl Ui {
             .get(&id)
             .is_some_and(|terminal| terminal.running())
         {
-            self.session.start(id);
+            self.session.restore(id);
         }
         self.refresh();
-        self.focus.focus(window, cx);
+        self.focus_current_view(window, cx);
     }
     fn toggle_workspace_expanded(&mut self, id: Uuid) {
         if let Some(index) = self.expanded_workspaces.iter().position(|item| *item == id) {
@@ -541,107 +789,38 @@ impl Ui {
             self.select_tab(tab, window, cx);
         }
     }
-    fn toggle_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.transcript.is_some() {
-            self.transcript = None;
-            self.focus.focus(window, cx);
-            return;
-        }
-        let Some(tab) = self
-            .session
-            .selected()
-            .and_then(|id| self.session.data.tab(id))
-            .cloned()
-        else {
-            return;
-        };
-        let root = self.session.store.root.clone();
-        match vibe_terminal::transcript::locate(&tab, &root) {
-            Some(path) => match vibe_terminal::transcript::read(&path) {
-                Ok(transcript) => self.transcript = Some(transcript),
-                Err(error) => self.session.error = Some(format!("无法读取会话文件：{error:#}")),
-            },
-            None => self.session.error = Some(
-                "当前标签没有可读的会话文件：目前支持 Pi 与 Codex（Claude 本机未留下 transcript）"
-                    .to_owned(),
-            ),
-        }
+    fn button_style(selected: bool, cx: &App) -> ButtonCustomVariant {
+        ButtonCustomVariant::new(cx)
+            .color(if selected {
+                rgb(0x2c4035).into()
+            } else {
+                rgba(0).into()
+            })
+            .foreground(rgb(if selected { ACCENT } else { FG }).into())
+            .hover(rgb(if selected { 0x486451 } else { 0x414c45 }).into())
+            .active(rgb(0x587360).into())
     }
-    fn transcript_view(
-        &self,
-        transcript: &vibe_terminal::transcript::Transcript,
+    fn tool_button(
+        id: impl Into<ElementId>,
+        label: &'static str,
+        icon: gpui_kit::assets::IconName,
+        selected: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let mut list = div()
-            .id("transcript")
-            .flex()
-            .flex_col()
-            .gap_3()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_4();
-        for message in &transcript.messages {
-            let color = match message.role {
-                vibe_terminal::transcript::Role::User => ACCENT,
-                vibe_terminal::transcript::Role::Assistant => FG,
-                vibe_terminal::transcript::Role::Tool => MUTED,
-                vibe_terminal::transcript::Role::System => MUTED,
-            };
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(color))
-                            .child(message.role.label()),
-                    )
-                    .child(div().text_sm().child(message.text.clone())),
-            );
-        }
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_4()
-                    .py_2()
-                    .bg(rgb(PANEL))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                        "{} 条消息 · {}",
-                        transcript.messages.len(),
-                        transcript.source.display()
-                    )))
-                    .child(div().flex_1())
-                    .child(Self::button(
-                        "refresh-transcript",
-                        "刷新",
-                        cx,
-                        |s, window, cx| {
-                            s.transcript = None;
-                            s.toggle_transcript(window, cx);
-                        },
-                    ))
-                    .child(Self::button(
-                        "close-transcript",
-                        "返回终端",
-                        cx,
-                        |s, window, cx| {
-                            s.transcript = None;
-                            s.focus.focus(window, cx);
-                        },
-                    )),
-            )
-            .child(list)
-            .into_any_element()
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Button {
+        Button::new(id)
+            .with_size(gpui_kit::component::Size::Size(px(20.0)))
+            .size(px(20.0))
+            .p_0()
+            .child(control_icon(icon))
+            .custom(Self::button_style(selected, cx))
+            .accessibility_label(label)
+            .tooltip(label)
+            .on_click(cx.listener(move |s, _, w, cx| {
+                cx.stop_propagation();
+                action(s, w, cx);
+                cx.notify();
+            }))
     }
     fn button(
         id: impl Into<ElementId>,
@@ -652,7 +831,7 @@ impl Ui {
         Button::new(id)
             .label(label)
             .small()
-            .ghost()
+            .custom(Self::button_style(false, cx))
             .on_click(cx.listener(move |ui, _, window, cx| {
                 f(ui, window, cx);
                 cx.notify();
@@ -679,6 +858,7 @@ impl Ui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.active_document = None;
         self.settings = false;
         self.editor = None;
         self.wheel.reset();
@@ -689,16 +869,30 @@ impl Ui {
         self.focus.focus(window, cx);
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_terminal_with(CliProfile::default_shell(), window, cx);
+        let profile = if self
+            .session
+            .data
+            .workspace()
+            .is_some_and(|w| w.remote.is_some())
+        {
+            vibe_terminal::ssh::profiles().remove(0)
+        } else {
+            CliProfile::default_shell()
+        };
+        self.new_terminal_with(profile, window, cx);
     }
     fn new_terminal_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some((x, y)) = self.new_menu else {
             return div().into_any_element();
         };
         let mut panel = div()
+            .id("new-terminal-menu")
+            .test_support()
+            .max_h(px(480.0))
+            .overflow_y_scroll()
             .absolute()
             .left(px(x))
-            .top(px(y + 6.0))
+            .top(px(y.max(40.0) + 6.0))
             .w(px(232.0))
             .flex()
             .flex_col()
@@ -728,21 +922,32 @@ impl Ui {
         }
         for profile in profiles {
             let name = profile.name.clone();
+            let glyph = profile_icon(&profile);
+            let category = if profile.kind == CliKind::Shell {
+                "Shell"
+            } else {
+                "Agent"
+            };
             panel = panel.child(
                 div()
                     .id(SharedString::from(format!("new-terminal-{}", profile.id)))
+                    .test_support()
                     .w_full()
                     .flex()
                     .items_center()
+                    .gap_2()
                     .px_2()
-                    .py_1()
+                    .h(px(36.0))
                     .rounded_md()
+                    .hover(|style| style.bg(rgb(0x313131)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |s, _, window, cx| {
                         s.new_terminal_with(profile.clone(), window, cx);
                         cx.notify();
                     }))
-                    .child(div().text_sm().child(name)),
+                    .child(glyph)
+                    .child(div().flex_1().text_sm().child(name))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(category)),
             );
         }
         div()
@@ -762,6 +967,14 @@ impl Ui {
     }
     /// ＋ 菜单内容：内置 CMD / PowerShell 在前，其后是检测到且已启用的 Agent。
     fn menu_profiles(&self) -> Vec<CliProfile> {
+        if self
+            .session
+            .data
+            .workspace()
+            .is_some_and(|w| w.remote.is_some())
+        {
+            return vibe_terminal::ssh::profiles();
+        }
         let mut profiles = self.session.data.profiles.clone();
         for detected in &self.detected_agents {
             if self
@@ -903,14 +1116,30 @@ impl Ui {
             .flex()
             .flex_col()
             .gap_1()
-            .w(px(180.0))
+            .w(px(SIDEBAR_WIDTH))
+            .flex_shrink_0()
             .h_full()
-            .p_4()
+            .px_2()
+            .pb_2()
             .bg(rgb(PANEL))
-            .child(div().text_xs().text_color(rgb(MUTED)).pb_2().child("设置"));
+            .border_r_1()
+            .border_color(rgb(0x303030))
+            .child(
+                div()
+                    .h(px(48.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("设置"),
+            );
         for tab in [
+            SettingsTab::General,
             SettingsTab::Agents,
             SettingsTab::Shortcuts,
+            SettingsTab::SshHosts,
             SettingsTab::Remote,
         ] {
             let active = self.settings_tab == tab;
@@ -933,28 +1162,13 @@ impl Ui {
                     .child(div().text_sm().child(tab.title())),
             );
         }
-        let nav = nav.child(div().flex_1()).child(
-            div()
-                .id("close-settings")
-                .w_full()
-                .flex()
-                .items_center()
-                .px_2()
-                .py_2()
-                .rounded_md()
-                .cursor_pointer()
-                .text_color(rgb(MUTED))
-                .on_click(cx.listener(|s, _, window, cx| {
-                    s.settings = false;
-                    s.focus.focus(window, cx);
-                    cx.notify();
-                }))
-                .child(div().text_sm().child("返回工作区")),
-        );
+        let nav = nav.child(div().flex_1()).child(self.navigation_footer(cx));
         let body = match self.settings_tab {
+            SettingsTab::General => self.general_pane(cx),
             SettingsTab::Agents => self.agents_pane(cx),
             SettingsTab::Shortcuts => self.shortcuts_pane(),
             SettingsTab::Remote => self.web_settings(cx),
+            SettingsTab::SshHosts => self.ssh_settings(cx),
         };
         div()
             .id("settings-page")
@@ -981,6 +1195,42 @@ impl Ui {
                             .child(self.settings_tab.title()),
                     )
                     .child(body),
+            )
+            .into_any_element()
+    }
+    fn general_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_sm().child("输入光标样式"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("选择终端输入位置的光标形状。默认小方块，修改后立即生效并自动保存。"),
+            )
+            .child(
+                div().flex().gap_2().children(
+                    [
+                        ("cursor-style-block", "小方块", InputCursorStyle::Block),
+                        ("cursor-style-bar", "竖线", InputCursorStyle::Bar),
+                    ]
+                    .into_iter()
+                    .map(|(id, label, style)| {
+                        Button::new(id)
+                            .small()
+                            .label(label)
+                            .selected(self.session.data.input_cursor_style == style)
+                            .on_click(cx.listener(move |ui, _, _, cx| {
+                                if ui.session.data.input_cursor_style != style {
+                                    ui.session.data.input_cursor_style = style;
+                                    ui.session.persist();
+                                    cx.notify();
+                                }
+                            }))
+                    }),
+                ),
             )
             .into_any_element()
     }
@@ -1108,6 +1358,9 @@ impl Ui {
         self.session.persist();
     }
     fn choose_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_workspace_dialog(window, cx);
+    }
+    fn pick_local_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1133,24 +1386,6 @@ impl Ui {
                 });
             }
             _ => {}
-        })
-        .detach();
-    }
-    fn choose_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("选择图片".into()),
-        });
-        cx.spawn_in(window, async move |weak, cx| {
-            if let Ok(Ok(Some(paths))) = paths.await {
-                if let Some(path) = paths.into_iter().next() {
-                    let _ = weak.update_in(cx, |ui, window, cx| {
-                        ui.request_preview_action(PreviewAction::Image(path), window, cx);
-                    });
-                }
-            }
         })
         .detach();
     }
@@ -1215,7 +1450,7 @@ impl Ui {
                 .session
                 .data
                 .tab(*id)
-                .map(|t| t.title.clone())
+                .map(|t| t.display_title().to_owned())
                 .unwrap_or_default(),
             _ => String::new(),
         };
@@ -1234,10 +1469,14 @@ impl Ui {
         self.dialog = None;
         self.editor = None;
         self.pending_preview = None;
-        if restore_file && let Some(input) = &self.preview_editor {
+        self.pending_document = None;
+        if restore_file
+            && self.active_document.is_none()
+            && let Some(input) = &self.preview_editor
+        {
             input.update(cx, |state, cx| state.focus(window, cx));
         } else {
-            self.focus.focus(window, cx);
+            self.focus_current_view(window, cx);
         }
     }
     fn apply_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1265,17 +1504,13 @@ impl Ui {
                     return;
                 }
                 if let Some(t) = self.session.data.tab_mut(id) {
-                    t.title = value;
+                    t.rename(value);
                 }
             }
             Dialog::RemoveWorkspace(id) => {
-                if self.preview_dirty {
-                    self.request_preview_action(PreviewAction::RemoveWorkspace(id), window, cx);
-                    return;
-                }
-                self.session.remove_workspace(id);
-                self.preview = None;
-                self.preview_request = None;
+                self.close_dialog(window, cx);
+                self.request_preview_action(PreviewAction::RemoveWorkspace(id), window, cx);
+                return;
             }
             Dialog::CloseTab(id) => self.session.close_tab(id),
             Dialog::UnsavedPreview => {
@@ -1295,6 +1530,15 @@ impl Ui {
     }
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        if self.ssh.modal.is_some() {
+            if key == "escape" {
+                self.ssh.modal = None;
+                self.focus_current_view(window, cx);
+                cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
         let m = event.keystroke.modifiers;
         let primary = if cfg!(target_os = "macos") {
             m.platform
@@ -1324,9 +1568,8 @@ impl Ui {
             }
             return;
         }
-        if self.transcript.is_some() && key == "escape" {
-            self.transcript = None;
-            self.focus.focus(window, cx);
+        if self.content_visible() && self.focus.is_focused(window) && key == "escape" {
+            self.toggle_transcript(window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1334,7 +1577,7 @@ impl Ui {
         if self.settings && key == "escape" {
             self.settings = false;
             self.editor = None;
-            self.focus.focus(window, cx);
+            self.focus_current_view(window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1354,6 +1597,11 @@ impl Ui {
             cx.notify();
             return;
         }
+        if primary && key == "s" && self.active_document.is_some() {
+            self.save_document(self.active_document.unwrap(), cx);
+            cx.stop_propagation();
+            return;
+        }
         if primary && key == "t" {
             self.new_terminal(window, cx);
             cx.stop_propagation();
@@ -1370,12 +1618,14 @@ impl Ui {
             if self.settings {
                 self.settings = false;
                 self.editor = None;
-                self.focus.focus(window, cx);
+                self.focus_current_view(window, cx);
                 cx.stop_propagation();
                 cx.notify();
                 return;
             }
-            if let Some(id) = self.session.selected() {
+            if let Some(id) = self.active_document {
+                self.request_close_document(id, window, cx);
+            } else if let Some(id) = self.session.selected() {
                 self.open_dialog(Dialog::CloseTab(id), window, cx);
             }
             cx.stop_propagation();
@@ -1389,14 +1639,8 @@ impl Ui {
                 .and_then(|c| c.to_digit(10))
                 .filter(|digit| (1..=9).contains(digit))
             {
-                let target = self
-                    .session
-                    .data
-                    .workspace()
-                    .and_then(|workspace| workspace.tabs.get(index as usize - 1))
-                    .map(|tab| tab.id);
-                if let Some(id) = target {
-                    self.select_tab(id, window, cx);
+                if let Some(target) = self.main_tabs().get(index as usize - 1).copied() {
+                    self.select_main_tab(target, window, cx);
                 }
                 cx.stop_propagation();
                 cx.notify();
@@ -1404,27 +1648,34 @@ impl Ui {
             }
         }
         if m.control && key == "tab" {
-            if let Some(w) = self.session.data.workspace() {
-                if !w.tabs.is_empty() {
-                    let index = w
-                        .tabs
-                        .iter()
-                        .position(|t| Some(t.id) == w.selected_tab)
-                        .unwrap_or(0);
-                    let next = if m.shift {
-                        (index + w.tabs.len() - 1) % w.tabs.len()
-                    } else {
-                        (index + 1) % w.tabs.len()
-                    };
-                    let id = w.tabs[next].id;
-                    self.select_tab(id, window, cx);
-                }
+            let tabs = self.main_tabs();
+            if !tabs.is_empty() {
+                let index = tabs
+                    .iter()
+                    .position(|target| Some(*target) == self.current_main_tab())
+                    .unwrap_or(0);
+                let next = if m.shift {
+                    (index + tabs.len() - 1) % tabs.len()
+                } else {
+                    (index + 1) % tabs.len()
+                };
+                self.select_main_tab(tabs[next], window, cx);
             }
             cx.stop_propagation();
             cx.notify();
             return;
         }
-        if !self.focus.is_focused(window) || self.session.page() != WorkspacePage::Terminal {
+        let image_paste_key = (primary && key == "v")
+            || (m.alt && !m.control && key == "v")
+            || (m.shift && key == "insert");
+        if image_paste_key && self.try_paste_image(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.active_document.is_some()
+            || self.content_visible()
+            || !self.focus.is_focused(window)
+        {
             return;
         }
         if primary
@@ -1454,10 +1705,103 @@ impl Ui {
             })
             .unwrap_or(false);
         if let Some(bytes) = key_bytes(key, m.control, m.alt, m.shift, cursor) {
-            self.session.send(bytes);
+            let has_image = self
+                .session
+                .selected()
+                .and_then(|id| self.native_images.get(&id))
+                .is_some_and(|target| self.session.paste_target_current(target));
+            self.session.send_input(bytes, has_image);
             self.selection = None;
             cx.stop_propagation();
             cx.notify();
+        }
+    }
+    fn forward_mouse(
+        &mut self,
+        id: Uuid,
+        point: CellPoint,
+        event: vibe_terminal::scroll::MouseButtonEvent,
+        modifiers: Modifiers,
+    ) -> bool {
+        let fullscreen_cli = self.session.data.tab(id).is_some_and(|tab| {
+            matches!(
+                tab.profile.kind,
+                CliKind::Claude | CliKind::Codex | CliKind::Pi
+            )
+        });
+        let sequence = self
+            .session
+            .terminals
+            .get(&id)
+            .filter(|t| t.running())
+            .and_then(|t| {
+                t.buffer.lock().ok().and_then(|buffer| {
+                    let screen = buffer.parser.screen();
+                    let (rows, cols) = screen.size();
+                    // Hover leave uses an out-of-grid coordinate so the TUI
+                    // can clear its active scrollbar even beyond this pane.
+                    let extra = u16::from(matches!(
+                        event,
+                        vibe_terminal::scroll::MouseButtonEvent::Move
+                    ));
+                    vibe_terminal::scroll::mouse_button_sequence(
+                        screen,
+                        event,
+                        (point.0 as u16).min(rows.saturating_sub(1) + extra),
+                        (point.1 as u16).min(cols.saturating_sub(1) + extra),
+                        modifiers.alt,
+                        modifiers.control,
+                        fullscreen_cli,
+                    )
+                })
+            });
+        let Some(sequence) = sequence else {
+            return false;
+        };
+        if let Some(terminal) = self.session.terminals.get(&id) {
+            let result = terminal.send(sequence);
+            self.session.result(result);
+        }
+        true
+    }
+    fn clear_mouse_hover(&mut self) {
+        if let Some((id, _)) = self.mouse_hover.take() {
+            self.forward_mouse(
+                id,
+                (u16::MAX as usize, u16::MAX as usize),
+                vibe_terminal::scroll::MouseButtonEvent::Move,
+                Modifiers::default(),
+            );
+        }
+    }
+    fn terminal_cursor(&self) -> CursorStyle {
+        if let Some(position) = self.terminal_pointer {
+            let x = f32::from(position.x - self.bounds.origin.x) - INSET;
+            let y = f32::from(position.y - self.bounds.origin.y) - INSET;
+            if x >= 0.0
+                && y >= 0.0
+                && x < self.snapshot.cols as f32 * CELL
+                && y < self.snapshot.rows as f32 * LINE
+            {
+                let row = (y / LINE).floor() as usize;
+                let col = (x / CELL).floor() as usize;
+                if self.snapshot.link_at(row, col).is_some()
+                    || self.snapshot.web_link_at(row, col).is_some()
+                {
+                    return CursorStyle::PointingHand;
+                }
+            }
+        }
+        CursorStyle::Arrow
+    }
+    fn terminal_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if !hovered {
+            if self.terminal_pointer.take().is_some() {
+                cx.notify();
+            }
+            if self.mouse_capture.is_none() {
+                self.clear_mouse_hover();
+            }
         }
     }
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1476,6 +1820,20 @@ impl Ui {
         if primary {
             self.path_press = Some((point, event.position));
             self.selecting = false;
+        } else if !event.modifiers.shift
+            && let Some(id) = self.session.selected()
+            && self.forward_mouse(
+                id,
+                point,
+                vibe_terminal::scroll::MouseButtonEvent::Press,
+                event.modifiers,
+            )
+        {
+            self.mouse_capture = Some((id, point));
+            self.selection = None;
+            self.selecting = false;
+            self.path_press = None;
+            cx.stop_propagation();
         } else {
             self.selection = Some((point, point));
             self.selecting = true;
@@ -1484,10 +1842,85 @@ impl Ui {
         cx.notify();
     }
     fn mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let previous_cursor = self.terminal_cursor();
+        self.terminal_pointer = Some(event.position);
+        if previous_cursor != self.terminal_cursor() {
+            cx.notify();
+        }
         if let Some((origin, width)) = self.resize_origin {
-            self.preview_width = (width - f32::from(event.position.x - origin)).clamp(280.0, 800.0);
+            if self.resizing_terminal_preview {
+                self.terminal_preview_width =
+                    (width - f32::from(event.position.x - origin)).clamp(120.0, 800.0);
+            } else {
+                self.preview_width =
+                    (width - f32::from(event.position.x - origin)).clamp(280.0, 800.0);
+            }
             cx.notify();
             return;
+        }
+        if let Some((id, previous)) = self.mouse_capture {
+            let point = render::cell_at(
+                event.position,
+                self.bounds,
+                self.snapshot.rows,
+                self.snapshot.cols,
+            );
+            if !event.dragging() {
+                self.forward_mouse(
+                    id,
+                    point,
+                    vibe_terminal::scroll::MouseButtonEvent::Release,
+                    event.modifiers,
+                );
+                self.mouse_capture = None;
+                self.mouse_hover = Some((id, point));
+                if !self.bounds.contains(&event.position) {
+                    self.clear_mouse_hover();
+                }
+            } else if point != previous {
+                self.forward_mouse(
+                    id,
+                    point,
+                    vibe_terminal::scroll::MouseButtonEvent::Drag,
+                    event.modifiers,
+                );
+                self.mouse_capture = Some((id, point));
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if !self.selecting && event.pressed_button.is_none() {
+            if !self.settings
+                && self.dialog.is_none()
+                && self.new_menu.is_none()
+                && !self.content_visible()
+                && self.bounds.contains(&event.position)
+                && let Some(id) = self.session.selected()
+            {
+                let (row, col) = render::cell_at(
+                    event.position,
+                    self.bounds,
+                    self.snapshot.rows,
+                    self.snapshot.cols,
+                );
+                let point = (row, col.min(self.snapshot.cols.saturating_sub(1) as usize));
+                if self.mouse_hover != Some((id, point)) {
+                    if self.mouse_hover.is_some_and(|(previous, _)| previous != id) {
+                        self.clear_mouse_hover();
+                    }
+                    if self.forward_mouse(
+                        id,
+                        point,
+                        vibe_terminal::scroll::MouseButtonEvent::Move,
+                        event.modifiers,
+                    ) {
+                        self.mouse_hover = Some((id, point));
+                    }
+                }
+                cx.stop_propagation();
+            } else {
+                self.clear_mouse_hover();
+            }
         }
         if self.selecting {
             if let Some((start, _)) = self.selection {
@@ -1507,12 +1940,35 @@ impl Ui {
     fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.selecting = false;
         self.resize_origin = None;
+        if let Some((id, _)) = self.mouse_capture.take() {
+            let point = render::cell_at(
+                event.position,
+                self.bounds,
+                self.snapshot.rows,
+                self.snapshot.cols,
+            );
+            self.forward_mouse(
+                id,
+                point,
+                vibe_terminal::scroll::MouseButtonEvent::Release,
+                event.modifiers,
+            );
+            self.mouse_hover = Some((id, point));
+            if !self.bounds.contains(&event.position) {
+                self.clear_mouse_hover();
+            }
+            cx.stop_propagation();
+            return;
+        }
         if let Some((point, start)) = self.path_press.take() {
             if (f32::from(event.position.x - start.x)).abs() < 4.0
                 && (f32::from(event.position.y - start.y)).abs() < 4.0
             {
                 if let Some(link) = self.snapshot.link_at(point.0, point.1).cloned() {
                     self.request_preview_action(PreviewAction::File(link), window, cx);
+                    cx.notify();
+                } else if let Some(link) = self.snapshot.web_link_at(point.0, point.1) {
+                    self.request_preview_action(PreviewAction::Web(link.url.clone()), window, cx);
                     cx.notify();
                 }
             }
@@ -1589,152 +2045,144 @@ impl Ui {
     }
     fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_1();
-        for w in &self.session.data.workspaces {
-            let id = w.id;
-            let active = Some(id) == self.session.data.selected_workspace;
+        for workspace in &self.session.data.workspaces {
+            let id = workspace.id;
+            let active = self.session.data.selected_workspace == Some(id);
             let expanded = self.expanded_workspaces.contains(&id);
-            let mut badges = div().flex().flex_wrap().gap_1().px_2().pb_1();
-            for tab in &w.tabs {
-                let (glyph, color) = profile_badge(&tab.profile);
-                let running = self
-                    .session
-                    .terminals
-                    .get(&tab.id)
-                    .is_some_and(|terminal| terminal.running());
-                badges = badges.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(20.0))
-                        .h(px(20.0))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(if running { color } else { 0x3a3a3a }))
-                        .text_xs()
-                        .text_color(rgb(if running { color } else { MUTED }))
-                        .child(glyph),
-                );
-            }
-            let mut item = div()
-                .id(SharedString::from(format!("workspace-{id}")))
-                .flex()
-                .flex_col()
-                .rounded_md()
-                .p_1()
-                .bg(rgb(if active { SURFACE } else { PANEL }))
+            let heading = div()
+                .id(SharedString::from(format!("workspace-heading-{id}")))
+                .rounded_sm()
                 .cursor_pointer()
+                .hover(|style| style.bg(rgb(SURFACE)))
                 .on_click(cx.listener(move |s, _, window, cx| {
-                    s.request_workspace(id, window, cx);
+                    if s.session.data.selected_workspace != Some(id) {
+                        s.request_workspace(id, window, cx);
+                    }
+                    s.toggle_workspace_expanded(id);
                     cx.notify();
                 }))
+                .flex()
+                .items_center()
+                .h(px(32.0))
+                .gap_1()
+                .px_1()
+                .child(Self::tool_button(
+                    SharedString::from(format!("workspace-toggle-{id}")),
+                    "展开或折叠项目",
+                    if expanded {
+                        gpui_kit::assets::IconName::ChevronDown
+                    } else {
+                        gpui_kit::assets::IconName::ChevronRight
+                    },
+                    false,
+                    cx,
+                    move |s, _, cx| {
+                        s.toggle_workspace_expanded(id);
+                        cx.notify();
+                    },
+                ))
                 .child(
                     div()
+                        .id(SharedString::from(format!("workspace-{id}")))
                         .flex()
                         .items_center()
-                        .gap_1()
-                        .child(Self::button(
-                            SharedString::from(format!("workspace-toggle-{id}")),
-                            if expanded { "▾" } else { "▸" },
-                            cx,
-                            move |s, _, _| s.toggle_workspace_expanded(id),
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_align(TextAlign::Left)
-                                .child(w.name.clone()),
-                        )
-                        .child(Self::button(
-                            SharedString::from(format!("workspace-settings-{id}")),
-                            "···",
-                            cx,
-                            move |s, window, cx| {
-                                s.open_dialog(Dialog::RenameWorkspace(id), window, cx)
-                            },
-                        )),
+                        .gap_2()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(rgb(if active { FG } else { MUTED }))
+                        .child(icon(if workspace.remote.is_some() {
+                            "server"
+                        } else {
+                            "folder"
+                        }))
+                        .child(div().min_w_0().truncate().child(workspace.name.clone())),
                 )
-                .child(badges);
+                .child(Self::tool_button(
+                    SharedString::from(format!("workspace-settings-{id}")),
+                    "项目设置",
+                    gpui_kit::assets::IconName::Ellipsis,
+                    false,
+                    cx,
+                    move |s, w, cx| s.open_dialog(Dialog::RenameWorkspace(id), w, cx),
+                ));
+            let mut group = div().flex().flex_col().child(heading);
             if expanded {
-                let mut rows = div().flex().flex_col().gap_1().pl_4().pb_1();
-                for tab in &w.tabs {
+                let mut sessions = div().flex().flex_col().gap(px(2.0)).pl_4().pb_1();
+                for tab in &workspace.tabs {
                     let tab_id = tab.id;
-                    let (glyph, color) = profile_badge(&tab.profile);
+                    let selected = active && workspace.selected_tab == Some(tab_id);
                     let running = self
                         .session
                         .terminals
                         .get(&tab_id)
-                        .is_some_and(|terminal| terminal.running());
-                    rows = rows.child(
+                        .is_some_and(|t| t.running());
+                    sessions = sessions.child(
                         div()
                             .id(SharedString::from(format!("workspace-tab-{tab_id}")))
                             .flex()
                             .items_center()
                             .gap_2()
+                            .h(px(28.0))
                             .px_2()
-                            .py_1()
-                            .rounded_md()
+                            .rounded_sm()
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x313131)))
-                            .on_click(cx.listener(move |s, _, window, cx| {
-                                s.open_tab(id, tab_id, window, cx);
+                            .bg(rgb(if selected { 0x313131 } else { PANEL }))
+                            .hover(|s| s.bg(rgb(SURFACE)))
+                            .text_xs()
+                            .text_color(rgb(if selected { FG } else { MUTED }))
+                            .on_click(cx.listener(move |s, _, w, cx| {
+                                s.open_tab(id, tab_id, w, cx);
                                 cx.notify();
                             }))
+                            .child(profile_icon_sized(&tab.profile, px(14.0)))
                             .child(
                                 div()
-                                    .w(px(20.0))
-                                    .text_xs()
-                                    .text_color(rgb(color))
-                                    .child(glyph),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(tab.display_title().to_owned()),
                             )
-                            .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(if running { ACCENT } else { MUTED }))
-                                    .child(if running { "●" } else { "◌" }),
-                            ),
+                            .child(div().size(px(4.0)).rounded_full().bg(rgb(if running {
+                                ACCENT
+                            } else {
+                                0x63705f
+                            }))),
                     );
                 }
-                item = item.child(rows);
+                group = group.child(sessions);
             }
-            list = list.child(item);
+            list = list.child(group);
         }
         div()
+            .w(px(SIDEBAR_WIDTH))
+            .flex_shrink_0()
+            .h_full()
             .flex()
             .flex_col()
-            .w(px(240.0))
-            .h_full()
-            .flex_shrink_0()
-            .p_4()
-            .gap_4()
+            .px_2()
+            .pb_2()
             .bg(rgb(PANEL))
+            .border_r_1()
+            .border_color(rgb(0x303030))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(40.0))
-                    .child(div().text_lg().text_color(rgb(ACCENT)).child("V"))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Vibe Terminal"),
-                    ),
-            )
-            .child(
-                div()
+                    .h(px(48.0))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .px_2()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child("工作区")
-                    .child(Self::button(
+                    .child("项目")
+                    .child(Self::tool_button(
                         "add-workspace-small",
-                        "＋",
+                        "添加工作区",
+                        gpui_kit::assets::IconName::Plus,
+                        false,
                         cx,
                         Self::choose_workspace,
                     )),
@@ -1747,167 +2195,12 @@ impl Ui {
                     .overflow_y_scroll()
                     .child(list),
             )
-            .child(
-                Button::new("settings")
-                    .icon(IconName::Settings)
-                    .small()
-                    .ghost()
-                    .accessibility_label("设置")
-                    .tooltip("设置")
-                    .on_click(cx.listener(|s, _, window, cx| {
-                        s.open_settings(window, cx);
-                        cx.notify();
-                    })),
-            )
-            .into_any_element()
-    }
-    fn overview(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(w) = self.session.data.workspace() else {
-            return div().into_any_element();
-        };
-        let tabs = w.tabs.len();
-        let running = w
-            .tabs
-            .iter()
-            .filter(|t| {
-                self.session
-                    .terminals
-                    .get(&t.id)
-                    .is_some_and(|t| t.running())
-            })
-            .count();
-        let card = |title: &'static str, value: String, detail: &'static str| {
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .p_4()
-                .gap_2()
-                .rounded_lg()
-                .bg(rgb(PANEL))
-                .border_1()
-                .border_color(rgb(SURFACE))
-                .child(div().text_xs().text_color(rgb(MUTED)).child(title))
-                .child(
-                    div()
-                        .text_2xl()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(value),
-                )
-                .child(div().text_xs().text_color(rgb(MUTED)).child(detail))
-        };
-        div()
-            .id("overview-page")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_6()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(w.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child("一个项目，一处工作空间。"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .child(card("终端标签", tabs.to_string(), "按项目独立保存"))
-                    .child(card("正在运行", running.to_string(), "关闭应用后全部退出"))
-                    .child(card(
-                        "尚未加载",
-                        w.tabs
-                            .iter()
-                            .filter(|t| {
-                                !self
-                                    .session
-                                    .terminals
-                                    .get(&t.id)
-                                    .is_some_and(|t| t.loaded())
-                            })
-                            .count()
-                            .to_string(),
-                        "需要时再恢复会话",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(SURFACE))
-                    .bg(rgb(PANEL))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("项目目录"))
-                    .child(
-                        div()
-                            .font_family("Geist Mono")
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child(display_path(&w.directory)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(Self::primary(
-                                "overview-new-terminal",
-                                "＋ 新终端",
-                                cx,
-                                |s, w, cx| s.new_terminal(w, cx),
-                            ))
-                            .child(Self::button(
-                                "overview-image",
-                                "打开图片",
-                                cx,
-                                Self::choose_image,
-                            )),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(SURFACE))
-                    .bg(rgb(PANEL))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("继续工作"))
-                    .children(w.tabs.iter().map(|tab| {
-                        let id = tab.id;
-                        Self::button(
-                            SharedString::from(format!("overview-tab-{id}")),
-                            format!("{}   ·   {}", tab.title, tab.profile.name),
-                            cx,
-                            move |s, w, cx| s.select_tab(id, w, cx),
-                        )
-                    })),
-            )
+            .child(self.navigation_footer(cx))
             .into_any_element()
     }
     fn terminal(&self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(transcript) = &self.transcript {
-            return self.transcript_view(transcript, cx);
+        if self.content_visible() {
+            return self.conversation_view(cx);
         }
         let pane = div()
             .flex()
@@ -1940,7 +2233,8 @@ impl Ui {
                 .overflow_hidden()
                 .track_focus(&self.focus)
                 .key_context("VibeTerminal")
-                .cursor(CursorStyle::IBeam)
+                .cursor(self.terminal_cursor())
+                .on_hover(cx.listener(Self::terminal_hover))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -1950,10 +2244,191 @@ impl Ui {
         )
         .into_any_element()
     }
+    fn web_preview(&self, web: &WebPreview, cx: &mut Context<Self>) -> AnyElement {
+        let header = div()
+            .flex()
+            .items_center()
+            .h(px(40.0))
+            .flex_shrink_0()
+            .bg(rgb(PANEL))
+            .px_3()
+            .gap_2()
+            .child(Self::button("web-back", "←", cx, |s, _, _| {
+                s.browser_command("history.back()")
+            }))
+            .child(Self::button("web-forward", "→", cx, |s, _, _| {
+                s.browser_command("history.forward()")
+            }))
+            .child(Self::button("web-reload", "刷新", cx, |s, _, cx| {
+                if let Some(PreviewContent::Web(web)) = &s.preview {
+                    if web.error.is_some() {
+                        let url = web.url.clone();
+                        s.browser = Rc::new(RefCell::new(crate::browser::Browser::new()));
+                        s.preview = Some(PreviewContent::Web(WebPreview {
+                            id: Uuid::new_v4(),
+                            url,
+                            error: None,
+                        }));
+                    } else {
+                        s.browser_command("location.reload()");
+                    }
+                }
+                cx.notify();
+            }))
+            .child(Self::button(
+                "web-devtools",
+                "开发者工具",
+                cx,
+                |s, _, _| {
+                    if matches!(s.preview, Some(PreviewContent::Web(_))) {
+                        s.browser.borrow().open_devtools();
+                    }
+                },
+            ))
+            .child(div().flex_1())
+            .child(Self::button("close-web", "×", cx, |s, w, cx| {
+                s.request_preview_action(PreviewAction::Close, w, cx)
+            }));
+        let address = div()
+            .flex()
+            .items_center()
+            .px_3()
+            .pb_2()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .child(web.url.clone()),
+            )
+            .child(Self::button(
+                "copy-web-url",
+                "复制地址",
+                cx,
+                |s, _, cx| {
+                    if let Some(PreviewContent::Web(web)) = &s.preview {
+                        cx.write_to_clipboard(ClipboardItem::new_string(web.url.clone()));
+                    }
+                },
+            ))
+            .child(Self::button(
+                "open-web-external",
+                "浏览器打开",
+                cx,
+                |s, _, cx| {
+                    if let Some(PreviewContent::Web(web)) = &s.preview {
+                        cx.open_url(&web.url);
+                    }
+                },
+            ));
+        let mut pane = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .bg(rgb(BG))
+            .child(header)
+            .child(address);
+        if let Some(error) = &web.error {
+            pane = pane.child(div().p_4().text_sm().child(format!(
+                "网页预览启动失败：{error}。可点击刷新重试，或使用浏览器打开。"
+            )));
+        } else if self.dialog.is_none() && self.ssh.modal.is_none() && self.new_menu.is_none() {
+            let browser = self.browser.clone();
+            let url = web.url.clone();
+            let data = self.session.store.root.join("webview");
+            let id = web.id;
+            let sender = self.sender.clone();
+            pane = pane.child(
+                div().flex_1().min_h_0().child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, cx| {
+                            let mut state = browser.borrow_mut();
+                            if state.failed
+                                || state.pending
+                                || f32::from(bounds.size.width) <= 0.0
+                                || f32::from(bounds.size.height) <= 0.0
+                            {
+                                return;
+                            }
+                            if state.initialized() {
+                                if let Err(error) = state.show(bounds) {
+                                    state.failed = true;
+                                    let _ = sender
+                                        .try_send(Event::BrowserError(id, format!("{error:#}")));
+                                }
+                                return;
+                            }
+                            let parent = match crate::browser::NativeParent::capture(window) {
+                                Ok(parent) => parent,
+                                Err(error) => {
+                                    state.failed = true;
+                                    let _ = sender
+                                        .try_send(Event::BrowserError(id, format!("{error:#}")));
+                                    return;
+                                }
+                            };
+                            state.pending = true;
+                            drop(state);
+                            // Wry construction runs a nested Windows message loop.
+                            // An executor task releases the paint's App/Window borrow
+                            // before that loop dispatches input, resize or redraw.
+                            cx.foreground_executor()
+                                .spawn(async move {
+                                    let navigation_sender = sender.clone();
+                                    let result = crate::browser::Browser::create(
+                                        parent,
+                                        bounds,
+                                        &url,
+                                        data,
+                                        move |url| {
+                                            let _ = navigation_sender
+                                                .try_send(Event::BrowserNavigated(id, url));
+                                        },
+                                    );
+                                    match result {
+                                        Ok(view) => {
+                                            *browser.borrow_mut() = view;
+                                            let _ = sender.try_send(Event::BrowserReady(id));
+                                        }
+                                        Err(error) => {
+                                            let mut state = browser.borrow_mut();
+                                            state.pending = false;
+                                            state.failed = true;
+                                            let _ = sender.try_send(Event::BrowserError(
+                                                id,
+                                                format!("{error:#}"),
+                                            ));
+                                        }
+                                    }
+                                })
+                                .detach();
+                        },
+                    )
+                    .size_full(),
+                ),
+            );
+        }
+        pane.into_any_element()
+    }
+    fn browser_command(&mut self, script: &str) {
+        if matches!(self.preview, Some(PreviewContent::Web(_))) {
+            let result = self.browser.borrow_mut().command(script);
+            self.session.result(result);
+        }
+    }
     fn preview(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(PreviewContent::Web(web)) = &self.preview {
+            return self.web_preview(web, cx);
+        }
         let path = match &self.preview {
             Some(PreviewContent::Code(c)) => Some(&c.file.path),
             Some(PreviewContent::Image(p)) => Some(p),
+            Some(PreviewContent::Web(_)) => unreachable!(),
             None => None,
         };
         let name = path
@@ -1964,10 +2439,13 @@ impl Ui {
                     .into_owned()
             })
             .unwrap_or_else(|| "正在读取文件".into());
-        let mut header = div()
+        let header = div()
             .flex()
             .items_center()
-            .h(px(48.0))
+            .h(px(40.0))
+            .flex_shrink_0()
+            .text_xs()
+            .bg(rgb(PANEL))
             .px_3()
             .gap_2()
             .child(
@@ -1982,8 +2460,23 @@ impl Ui {
                         if self.preview_dirty { " *" } else { "" }
                     )),
             );
+        let mut toolbar = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .flex_shrink_0()
+            .child(
+                div().flex_1().text_xs().text_color(rgb(MUTED)).child(
+                    path.and_then(|p| p.extension())
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("预览")
+                        .to_owned(),
+                ),
+            );
         if self.preview_editor.is_some() {
-            header = header
+            toolbar = toolbar
                 .child(Self::button(
                     "wrap-preview",
                     if self.preview_wrap {
@@ -2022,58 +2515,62 @@ impl Ui {
                     },
                 ));
         }
-        header = header
-            .child(Self::button(
-                "copy-preview",
-                if matches!(self.preview, Some(PreviewContent::Image(_))) {
-                    "复制路径"
-                } else {
-                    "复制"
-                },
-                cx,
-                |s, _, cx| {
-                    let text = if let Some(input) = &s.preview_editor {
-                        let state = input.read(cx);
-                        let selected = state.selected_value();
-                        Some(if selected.is_empty() {
-                            state.value().to_string()
-                        } else {
-                            selected.to_string()
-                        })
-                    } else if let Some(PreviewContent::Image(path)) = &s.preview {
-                        Some(display_path(path))
+        toolbar = toolbar.child(Self::button(
+            "copy-preview",
+            if matches!(self.preview, Some(PreviewContent::Image(_))) {
+                "复制路径"
+            } else {
+                "复制"
+            },
+            cx,
+            |s, _, cx| {
+                let text = if let Some(input) = &s.preview_editor {
+                    let state = input.read(cx);
+                    let selected = state.selected_value();
+                    Some(if selected.is_empty() {
+                        state.value().to_string()
                     } else {
-                        None
-                    };
-                    if let Some(text) = text {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    }
-                },
-            ))
-            .child(Self::button("close-preview", "×", cx, |s, w, cx| {
-                s.request_preview_action(PreviewAction::Close, w, cx)
-            }));
+                        selected.to_string()
+                    })
+                } else if let Some(PreviewContent::Image(path)) = &s.preview {
+                    Some(display_path(path))
+                } else {
+                    None
+                };
+                if let Some(text) = text {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            },
+        ));
         let mut pane = div()
             .flex()
             .flex_col()
-            .w(px(self.preview_width))
-            .h_full()
-            .flex_shrink_0()
+            .flex_1()
+            .min_h_0()
             .min_w_0()
-            .bg(rgb(PANEL))
-            .child(header);
+            .bg(rgb(BG))
+            .child(header.child(Self::tool_button(
+                "close-preview",
+                "关闭文件预览",
+                gpui_kit::assets::IconName::X,
+                false,
+                cx,
+                |s, w, cx| s.request_preview_action(PreviewAction::Close, w, cx),
+            )));
         if let Some(path) = path {
             pane = pane.child(
                 div()
                     .px_3()
-                    .pb_2()
+                    .pt_2()
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .truncate()
                     .child(display_path(path)),
             );
         }
+        pane = pane.child(toolbar);
         match &self.preview {
+            Some(PreviewContent::Web(_)) => unreachable!(),
             Some(PreviewContent::Image(path)) => {
                 pane = pane
                     .child(
@@ -2099,7 +2596,7 @@ impl Ui {
                             .min_h_0()
                             .min_w_0()
                             .font_family("Geist Mono")
-                            .text_size(px(14.0))
+                            .text_size(px(12.0))
                             .child(
                                 CodeEditor::new(input)
                                     .readonly(!self.preview_editing)
@@ -2144,7 +2641,7 @@ impl Ui {
             Dialog::RenameTab(_) => ("重命名终端", "设置便于识别的标签名称。", "保存"),
             Dialog::RemoveWorkspace(_) => (
                 "移除工作区",
-                "关闭该工作区的终端并移除记录，保留本地项目文件。",
+                "关闭该工作区的终端并移除记录，保留项目文件。",
                 "移除",
             ),
             Dialog::CloseTab(_) => ("关闭终端", "终止该标签的进程并移除历史记录。", "关闭终端"),
@@ -2223,136 +2720,39 @@ impl Ui {
 }
 impl Render for Ui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_project_panel();
+        if !matches!(self.preview, Some(PreviewContent::Web(_)))
+            || !self.panel.open
+            || self.panel.tab != PanelTab::Explorer
+            || self.settings
+            || self.dialog.is_some()
+            || self.ssh.modal.is_some()
+            || self.new_menu.is_some()
+            || self.session.data.workspace().is_none()
+        {
+            self.browser.borrow_mut().hide();
+        }
         self.preview_width = self
             .preview_width
-            .min((f32::from(window.viewport_size().width) - 564.0).max(280.0));
+            .min((f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 324.0).max(280.0));
         let mut content = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .h_full()
             .bg(rgb(BG));
         if self.settings {
             content = content.child(self.settings_page(cx));
-        } else if let Some(w) = self.session.data.workspace() {
-            let mut tabs = div().flex().gap_1().items_center().p_2();
-            tabs = tabs.child(Self::button(
-                "overview-tab",
-                "项目概览",
-                cx,
-                |s, _, _| {
-                    s.session.overview();
-                    s.selection = None;
-                },
-            ));
-            for tab in &w.tabs {
-                let id = tab.id;
-                let active = w.page == WorkspacePage::Terminal && w.selected_tab == Some(id);
-                let status = if self.session.terminals.get(&id).is_some_and(|t| t.running()) {
-                    "●"
-                } else {
-                    "◌"
-                };
-                tabs = tabs.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .rounded_md()
-                        .bg(rgb(if active { 0x313131 } else { PANEL }))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("tab-{id}")))
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .px_2()
-                                .py_1()
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |s, event: &ClickEvent, w, cx| {
-                                    if event.click_count() == 2 {
-                                        s.open_dialog(Dialog::RenameTab(id), w, cx);
-                                    } else {
-                                        s.select_tab(id, w, cx);
-                                    }
-                                    cx.notify();
-                                }))
-                                .child({
-                                    let (glyph, color) = profile_badge(&tab.profile);
-                                    div()
-                                        .w(px(18.0))
-                                        .text_xs()
-                                        .text_color(rgb(color))
-                                        .child(glyph)
-                                })
-                                .child(div().text_sm().child(format!("{status}  {}", tab.title))),
-                        )
-                        .child(Self::button(
-                            SharedString::from(format!("close-{id}")),
-                            "×",
-                            cx,
-                            move |s, w, cx| s.open_dialog(Dialog::CloseTab(id), w, cx),
-                        )),
-                );
-            }
-            tabs = tabs.child(
-                Button::new("new-terminal")
-                    .icon(IconName::Plus)
-                    .small()
-                    .ghost()
-                    .accessibility_label("新建终端")
-                    .tooltip("新建终端")
-                    .on_click(cx.listener(|s, event: &ClickEvent, _, cx| {
-                        let origin = event.position();
-                        s.detected_agents = vibe_terminal::agents::detected();
-                        s.new_menu = Some((origin.x.into(), origin.y.into()));
-                        cx.notify();
-                    })),
-            );
-            let transcript_ready = self.transcript.is_some()
-                || w.selected_tab
-                    .and_then(|id| w.tabs.iter().find(|tab| tab.id == id))
-                    .is_some_and(|tab| matches!(tab.profile.kind, CliKind::Pi | CliKind::Codex));
-            if transcript_ready {
-                tabs = tabs.child(Self::button(
-                    "toggle-transcript",
-                    if self.transcript.is_some() {
-                        "终端"
-                    } else {
-                        "内容"
-                    },
-                    cx,
-                    |s, window, cx| {
-                        s.toggle_transcript(window, cx);
-                        cx.notify();
-                    },
-                ));
-            }
-            content = content.child(
-                div()
-                    .id("tabs")
-                    .h(px(48.0))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pr_2()
-                    .flex_shrink_0()
-                    .bg(rgb(PANEL))
-                    .child(
-                        div()
-                            .id("tab-strip")
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_x_scroll()
-                            .child(tabs),
-                    ),
-            );
-            let page = match self.session.page() {
-                WorkspacePage::Overview => self.overview(cx),
-                WorkspacePage::Terminal => self.terminal(cx),
-            };
-            let mut work = div().flex().flex_1().min_h_0().min_w_0().child(page);
-            if self.preview.is_some() || self.preview_request.is_some() {
+        } else if self.session.data.workspace().is_some() {
+            let mut work = div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(self.main_area(window, cx));
+            if self.panel.open {
                 work = work
                     .child(
                         div()
@@ -2360,47 +2760,40 @@ impl Render for Ui {
                             .w(px(4.0))
                             .h_full()
                             .flex_shrink_0()
-                            .bg(rgb(SURFACE))
+                            .bg(rgb(0x30362b))
+                            .hover(|s| s.bg(rgb(ACCENT)))
                             .cursor(CursorStyle::ResizeLeftRight)
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|s, event: &MouseDownEvent, _, cx| {
+                                    s.resizing_terminal_preview = false;
                                     s.resize_origin = Some((event.position.x, s.preview_width));
                                     cx.stop_propagation();
                                 }),
                             ),
                     )
-                    .child(self.preview(cx));
+                    .child(self.right_panel(window, cx));
             }
             content = content.child(work);
         } else {
             content = content
                 .items_center()
                 .justify_center()
-                .gap_6()
+                .gap_4()
+                .child(icon("terminal").size(px(32.0)).text_color(rgb(MUTED)))
+                .child(div().text_lg().child("添加一个项目"))
                 .child(
                     div()
-                        .text_3xl()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("从一个项目开始"),
-                )
-                .child(
-                    div()
+                        .text_sm()
                         .text_color(rgb(MUTED))
-                        .child("选择本地目录，为 AI Coding 创建独立的工作区。"),
+                        .child("在项目目录中启动 Shell 或 Agent。"),
                 )
                 .child(Self::primary(
                     "empty-add-workspace",
-                    "＋ 创建工作区",
+                    "添加项目",
                     cx,
                     Self::choose_workspace,
-                ))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child("Claude Code  /  Codex  /  Pi  /  Shell"),
-                );
+                ));
         }
         if self.dialog.is_none() {
             if let Some(error) = &self.session.error {
@@ -2432,6 +2825,7 @@ impl Render for Ui {
             .relative()
             .size_full()
             .flex()
+            .flex_col()
             .font_family("Geist")
             .text_size(px(14.0))
             .text_color(rgb(FG))
@@ -2439,36 +2833,20 @@ impl Render for Ui {
             .capture_key_down(cx.listener(Self::on_key))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-            .children((!self.settings).then(|| self.sidebar(cx)))
-            .child(content)
+            .child(self.title_bar(window, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .children((!self.settings).then(|| self.sidebar(cx)))
+                    .child(content),
+            )
+            .child(self.status_bar())
             .children(self.dialog.as_ref().map(|_| self.dialog_view(cx)))
+            .children(self.ssh.modal.as_ref().map(|_| self.ssh_dialog_view(cx)))
             .children(self.new_menu.map(|_| self.new_terminal_menu(cx)))
-    }
-}
-
-/// Agent 徽标：一个短标识 + 颜色，用于侧边栏与标签栏。
-fn profile_badge(profile: &CliProfile) -> (String, u32) {
-    match profile.kind {
-        CliKind::Shell => {
-            let command = profile.command.to_ascii_lowercase();
-            if command.contains("pwsh") || command.contains("powershell") {
-                ("PS".to_owned(), 0x6fa8dc)
-            } else {
-                (">_".to_owned(), 0x9aa0a6)
-            }
-        }
-        CliKind::Claude => ("C".to_owned(), 0xd97757),
-        CliKind::Codex => ("X".to_owned(), 0x10a37f),
-        CliKind::Pi => ("π".to_owned(), ACCENT),
-        CliKind::Custom => {
-            let initial = profile
-                .name
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| "?".to_owned());
-            (initial, MUTED)
-        }
     }
 }
 
@@ -2523,6 +2901,20 @@ impl Element for TerminalSurface {
                 ui.session.resize(rows, cols);
                 ui.refresh();
             }
+            let ime_geometry = if ui.focus.is_focused(window) && ui.dialog.is_none() {
+                ui.snapshot
+                    .ime_bounds(bounds, &ui.preedit, ui.preedit.encode_utf16().count())
+                    .map(|caret| (caret, window.scale_factor()))
+            } else {
+                None
+            };
+            if ui.last_ime_geometry != ime_geometry {
+                ui.last_ime_geometry = ime_geometry;
+                if ime_geometry.is_some() {
+                    // Schedule after paint has registered the current handler.
+                    window.invalidate_character_coordinates();
+                }
+            }
         });
         let ui = self.owner.read(cx);
         let focused = ui.focus.is_focused(window)
@@ -2537,7 +2929,9 @@ impl Element for TerminalSurface {
             bounds,
             ui.selection,
             &ui.preedit,
+            ui.session.data.input_cursor_style,
             focused,
+            &mut ui.text_cache.borrow_mut(),
             window,
         )
     }
@@ -2617,7 +3011,11 @@ impl EntityInputHandler for Ui {
         cx: &mut Context<Self>,
     ) {
         self.preedit.clear();
-        if self.dialog.is_none() && self.session.page() == WorkspacePage::Terminal {
+        if self.dialog.is_none()
+            && self.ssh.modal.is_none()
+            && self.active_document.is_none()
+            && !self.content_visible()
+        {
             self.session.send(value.as_bytes().to_vec());
             self.selection = None;
         }
@@ -2636,17 +3034,12 @@ impl EntityInputHandler for Ui {
     }
     fn bounds_for_range(
         &mut self,
-        _: Range<usize>,
-        _: Bounds<Pixels>,
+        range: Range<usize>,
+        bounds: Bounds<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let (row, col) = self.snapshot.cursor?;
-        Some(Bounds::new(
-            self.bounds.origin
-                + point(px(INSET + col as f32 * CELL), px(INSET + row as f32 * LINE)),
-            size(px(CELL), px(LINE)),
-        ))
+        self.snapshot.ime_bounds(bounds, &self.preedit, range.start)
     }
     fn character_index_for_point(
         &mut self,
@@ -2748,6 +3141,266 @@ fn key_bytes(
 mod tests {
     use super::{key_bytes, load_code_preview};
     use vibe_terminal::paths::FileLink;
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "opens a native GPUI/WebView2 window and DevTools; run explicitly"]
+    fn native_web_preview_loads_javascript() {
+        use gpui_kit::*;
+        use std::{
+            io::{Read, Write},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+        let root =
+            std::env::temp_dir().join(format!("vibe-browser-smoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let ready = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_ready = ready.clone();
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(25);
+            while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..count]);
+                    if request.starts_with("GET /ready ") {
+                        server_ready.store(true, Ordering::Release);
+                    }
+                    let body = "<!doctype html><title>Vibe browser smoke</title><h1>WebView2 works</h1><script>fetch('/ready')</script>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                } else {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        let passed = Arc::new(AtomicBool::new(false));
+        let finished = passed.clone();
+        let test_root = root.clone();
+        gpui_kit::application()
+            .with_assets(crate::assets::Assets)
+            .run(move |cx| {
+                gpui_kit::init(cx);
+                let store = vibe_terminal::store::Store {
+                    root: test_root.clone(),
+                };
+                let mut session =
+                    vibe_terminal::session::Session::new(store, Default::default(), None);
+                session.add_workspace(&test_root);
+                let (handle, view) = gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                            None,
+                            size(px(1100.0), px(700.0)),
+                            cx,
+                        ))),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        window.set_window_title("Vibe browser click regression");
+                        cx.new(|cx| {
+                            let mut ui = super::Ui::new(session, window, cx);
+                            ui.demo = true;
+                            ui
+                        })
+                    },
+                )
+                .unwrap();
+                cx.spawn(async move |cx| {
+                    smol::Timer::after(Duration::from_secs(1)).await;
+                    let click_scale = handle.update(cx, |_, window, cx| {
+                        view.update(cx, |ui, _| {
+                            let root = std::env::temp_dir();
+                            let mut buffer = vibe_terminal::terminal::Buffer::new(10, 100, root.clone());
+                            buffer.process(url.as_bytes());
+                            ui.snapshot = Arc::new(crate::render::Snapshot::read(&buffer, &root));
+                            ui.path_press = Some(((0, 0), point(px(300.0), px(120.0))));
+                        });
+                        window.scale_factor()
+                    }).unwrap();
+                    // Deliver the actual native mouse-up message, as opposed to
+                    // calling the preview action before the first window draw.
+                    unsafe {
+                        use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_LBUTTONUP};
+                        let title: Vec<u16> = "Vibe browser click regression\0".encode_utf16().collect();
+                        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                        assert!(!hwnd.is_null());
+                        let x = (300.0 * click_scale) as isize;
+                        let y = (120.0 * click_scale) as isize;
+                        assert_ne!(PostMessageW(hwnd, WM_LBUTTONUP, 0, x | (y << 16)), 0);
+                    }
+                    let output_sender = cx.update(|cx| view.read(cx).sender.clone());
+                    let traffic = std::thread::spawn(move || {
+                        for _ in 0..50 {
+                            let _ = output_sender.send_blocking(super::Event::TailscaleAddress(Ok("fixture".into())));
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while Instant::now() < deadline {
+                        smol::Timer::after(Duration::from_millis(100)).await;
+                        if ready.load(Ordering::Acquire)
+                            && cx.update(|cx| view.read(cx).browser.borrow().initialized())
+                        {
+                            // Read native child geometry, confirming this is the
+                            // right preview panel inside the existing window.
+                            handle.update(cx, |_, window, cx| {
+                                view.update(cx, |ui, _| {
+                                    let browser = ui.browser.borrow();
+                                    let bounds = browser.native_bounds();
+                                    let position = bounds.position.to_logical::<f64>(window.scale_factor() as f64);
+                                    let size = bounds.size.to_logical::<f64>(window.scale_factor() as f64);
+                                    eprintln!("native preview: position={position:?}, size={size:?}, viewport={:?}, pane={}", window.viewport_size(), ui.preview_width);
+                                    assert!(position.x > 240.0 && position.y >= 48.0);
+                                    assert!((size.width - ui.preview_width as f64).abs() <= 2.0);
+                                    assert!(position.x + size.width <= f32::from(window.viewport_size().width) as f64 + 2.0);
+                                    browser.open_devtools();
+                                });
+                            }).unwrap();
+                            smol::Timer::after(Duration::from_secs(2)).await;
+                            handle
+                                .update(cx, |_, window, cx| {
+                                    view.update(cx, |ui, cx| {
+                                        ui.request_preview_action(
+                                            super::PreviewAction::Close,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                })
+                                .unwrap();
+                            finished.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                    traffic.join().unwrap();
+                    cx.update(|cx| cx.quit());
+                })
+                .detach();
+            });
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(
+            passed.load(Ordering::Acquire),
+            "WebView2 did not load and execute the fixture JavaScript"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "opens an isolated native window and checks the Windows IME anchor"]
+    fn native_hidden_cursor_ime_anchor_matches_terminal() {
+        use gpui_kit::*;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SendMessageW, WM_IME_STARTCOMPOSITION,
+        };
+        #[repr(C)]
+        #[derive(Default)]
+        struct CandidateForm {
+            index: u32,
+            style: u32,
+            x: i32,
+            y: i32,
+            area: [i32; 4],
+        }
+        #[link(name = "imm32")]
+        unsafe extern "system" {
+            fn ImmCreateContext() -> isize;
+            fn ImmAssociateContext(hwnd: *mut std::ffi::c_void, context: isize) -> isize;
+            fn ImmDestroyContext(context: isize) -> i32;
+            fn ImmGetCandidateWindow(context: isize, index: u32, form: *mut CandidateForm) -> i32;
+        }
+        let root = std::env::temp_dir().join(format!("vibe-ime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = vibe_terminal::store::Store { root: root.clone() };
+        let mut session = vibe_terminal::session::Session::new(store, Default::default(), None);
+        session.add_workspace(&root);
+        session.new_tab(vibe_terminal::model::CliProfile::default_shell());
+        let passed = Arc::new(AtomicBool::new(false));
+        let finished = passed.clone();
+        gpui_kit::application().with_assets(crate::assets::Assets).run(move |cx| {
+            gpui_kit::init(cx);
+            let (handle, view) = gpui_kit::open_window(WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(180.0), px(120.0)),
+                    size(px(1100.0), px(700.0)),
+                ))),
+                ..Default::default()
+            }, cx, |window, cx| {
+                window.set_window_title("Vibe IME coordinate regression");
+                cx.new(|cx| {
+                    let mut ui = super::Ui::new(session, window, cx);
+                    ui.demo = true;
+                    ui
+                })
+            }).unwrap();
+            cx.spawn(async move |cx| {
+                smol::Timer::after(Duration::from_secs(1)).await;
+                handle.update(cx, |_, window, cx| {
+                    view.update(cx, |ui, cx| {
+                        let id = ui.session.selected().unwrap();
+                        ui.session.terminals[&id].buffer.lock().unwrap().process(b"\x1b[?25l\x1b[8;9H");
+                        ui.refresh();
+                        ui.preedit = "ni".into();
+                        ui.focus.focus(window, cx);
+                        assert!(ui.snapshot.cursor.is_none());
+                        cx.notify();
+                    });
+                }).unwrap();
+                smol::Timer::after(Duration::from_millis(250)).await;
+                let (expected, scale) = handle.update(cx, |_, window, cx| {
+                    let ui = view.read(cx);
+                    (ui.snapshot.ime_bounds(ui.bounds, &ui.preedit, 2).unwrap(), window.scale_factor())
+                }).unwrap();
+                // Exercise the actual GPUI -> IMM bridge without typing into or
+                // changing the user's input method, clipboard or live sessions.
+                unsafe {
+                    let title: Vec<u16> = "Vibe IME coordinate regression\0".encode_utf16().collect();
+                    let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                    assert!(!hwnd.is_null());
+                    let context = ImmCreateContext();
+                    assert_ne!(context, 0);
+                    let previous = ImmAssociateContext(hwnd, context);
+                    SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
+                    let mut actual = CandidateForm::default();
+                    let result = ImmGetCandidateWindow(context, 0, &mut actual);
+                    ImmAssociateContext(hwnd, previous);
+                    ImmDestroyContext(context);
+                    assert_ne!(result, 0, "Windows must receive a candidate anchor even for a hidden cursor");
+                    let expected_x = (f32::from(expected.origin.x) * scale) as i32;
+                    let expected_y = (f32::from(expected.origin.y) * scale) as i32 + (f32::from(expected.size.height) * scale) as i32 / 2;
+                    eprintln!("IME native anchor: ({}, {}), expected: ({expected_x}, {expected_y}), scale={scale}", actual.x, actual.y);
+                    assert_eq!((actual.x, actual.y), (expected_x, expected_y));
+                }
+                handle.update(cx, |_, _, cx| view.update(cx, |ui, _| ui.session.shutdown())).unwrap();
+                finished.store(true, Ordering::Release);
+                cx.update(|cx| cx.quit());
+            }).detach();
+        });
+        assert!(passed.load(Ordering::Acquire));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn terminal_control_keys_are_not_plain_text() {
         assert_eq!(
