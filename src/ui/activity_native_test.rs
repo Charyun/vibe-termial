@@ -31,14 +31,19 @@ async fn capture(name: &str) {
         String::from_utf8_lossy(&result.stderr)
     );
 }
-fn mouse(message: u32, down: bool, scale: f32) {
+fn mouse(message: u32, down: bool, scale: f32, sidebar: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SendMessageW};
     unsafe {
         let title: Vec<u16> = "Vibe Agent status regression\0".encode_utf16().collect();
         let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
         assert!(!hwnd.is_null());
-        let x = (243.0 * scale).round() as i32;
-        let y = (20.0 * scale).round() as i32;
+        let (x, y) = if sidebar {
+            (100.0, 134.0)
+        } else {
+            (243.0, 20.0)
+        };
+        let x = (x * scale).round() as i32;
+        let y = (y * scale).round() as i32;
         SendMessageW(
             hwnd,
             message,
@@ -144,10 +149,10 @@ fn native_agent_tab_spins_completes_and_clears_on_click() {
                     let scale = handle
                         .update(cx, |_, window, _| window.scale_factor())
                         .unwrap();
-                    mouse(0x200, false, scale);
+                    mouse(0x200, false, scale, true);
                     smol::Timer::after(Duration::from_millis(80)).await;
-                    mouse(0x201, true, scale);
-                    mouse(0x202, false, scale);
+                    mouse(0x201, true, scale, true);
+                    mouse(0x202, false, scale, true);
                     let mut cleared = false;
                     for _ in 0..60 {
                         smol::Timer::after(Duration::from_millis(50)).await;
@@ -162,8 +167,42 @@ fn native_agent_tab_spins_completes_and_clears_on_click() {
                     }
                     assert!(
                         cleared,
-                        "clicking the terminal tab must acknowledge its completion"
+                        "clicking the navigation row must acknowledge completion on both surfaces"
                     );
+                    smol::Timer::after(Duration::from_millis(350)).await;
+                    assert_eq!(
+                        cx.update(|cx| view.read(cx).agent_activity.get(&first).copied()),
+                        Some(Indicator::None)
+                    );
+                    cx.update(|cx| {
+                        let ui = view.read(cx);
+                        assert!(ui.agent_activity_indicator(first, "sidebar").is_none());
+                        assert!(ui.agent_activity_indicator(first, "tab").is_none());
+                    });
+                    capture("sidebar-acknowledged").await;
+                    handle
+                        .update(cx, |_, _, cx| {
+                            view.update(cx, |ui, _| ui.session.send(b"WD".to_vec()))
+                        })
+                        .unwrap();
+                    let mut completed_again = false;
+                    for _ in 0..60 {
+                        smol::Timer::after(Duration::from_millis(50)).await;
+                        completed_again = cx.update(|cx| {
+                            view.read(cx).agent_activity.get(&first) == Some(&Indicator::Completed)
+                        });
+                        if completed_again {
+                            break;
+                        }
+                    }
+                    assert!(
+                        completed_again,
+                        "a new completion must appear on both surfaces after acknowledgment"
+                    );
+                    mouse(0x200, false, scale, false);
+                    smol::Timer::after(Duration::from_millis(80)).await;
+                    mouse(0x201, true, scale, false);
+                    mouse(0x202, false, scale, false);
                     smol::Timer::after(Duration::from_millis(350)).await;
                     assert_eq!(
                         cx.update(|cx| view.read(cx).agent_activity.get(&first).copied()),

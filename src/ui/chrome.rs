@@ -78,7 +78,7 @@ impl Ui {
                                     }
                                     cx.notify();
                                 }))
-                                .children(self.tab_activity_indicator(id))
+                                .children(self.agent_activity_indicator(id, "tab"))
                                 .child(profile_icon(&tab.profile))
                                 .child(div().truncate().child(tab.display_title().to_owned())),
                         )

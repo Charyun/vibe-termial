@@ -1,6 +1,6 @@
 # Agent activity in terminal tabs
 
-The 14px indicator before the Agent icon rotates during a turn and becomes a green dot for an unacknowledged completion. Idle tabs render no status element or reserved spacing. Selecting the corresponding terminal tab clears its completion, including keyboard tab selection. Selecting a tab during work leaves its spinner running. Protocol reports of a permission/question wait show amber; reported failures show red instead of a successful green. Those result notices are also acknowledged by tab selection.
+The terminal tab and navigation row share the same indicator before the Agent icon: it is 14px, rotates during a turn and becomes a green dot for an unacknowledged completion. Selecting either surface acknowledges the same completion. Idle tabs and navigation rows render no status element or reserved spacing. Selecting the corresponding terminal tab clears its completion, including keyboard tab selection. Selecting a tab during work leaves its spinner running. Protocol reports of a permission/question wait show amber; reported failures show red instead of a successful green. Those result notices are also acknowledged by tab selection.
 
 Activity belongs to the terminal process buffer, independently of the selected workspace, file tab or conversation presentation. Completed notices survive unrelated output and repeated `done` reports. A new turn clears the previous result. History replay cannot issue terminal replies or generate completion notices.
 

@@ -2114,11 +2114,6 @@ impl Ui {
                 for tab in &workspace.tabs {
                     let tab_id = tab.id;
                     let selected = active && workspace.selected_tab == Some(tab_id);
-                    let running = self
-                        .session
-                        .terminals
-                        .get(&tab_id)
-                        .is_some_and(|t| t.running());
                     sessions = sessions.child(
                         div()
                             .id(SharedString::from(format!("workspace-tab-{tab_id}")))
@@ -2137,6 +2132,7 @@ impl Ui {
                                 s.open_tab(id, tab_id, w, cx);
                                 cx.notify();
                             }))
+                            .children(self.agent_activity_indicator(tab_id, "sidebar"))
                             .child(profile_icon_sized(&tab.profile, px(14.0)))
                             .child(
                                 div()
@@ -2144,12 +2140,7 @@ impl Ui {
                                     .min_w_0()
                                     .truncate()
                                     .child(tab.display_title().to_owned()),
-                            )
-                            .child(div().size(px(4.0)).rounded_full().bg(rgb(if running {
-                                ACCENT
-                            } else {
-                                0x63705f
-                            }))),
+                            ),
                     );
                 }
                 group = group.child(sessions);

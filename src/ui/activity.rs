@@ -162,7 +162,11 @@ impl Ui {
             }
         })
     }
-    pub(super) fn tab_activity_indicator(&self, id: Uuid) -> Option<AnyElement> {
+    pub(super) fn agent_activity_indicator(
+        &self,
+        id: Uuid,
+        surface: &'static str,
+    ) -> Option<AnyElement> {
         let indicator = self.agent_activity.get(&id).copied().unwrap_or_default();
         if indicator == Indicator::None {
             return None;
@@ -175,7 +179,7 @@ impl Ui {
             Indicator::Failed => "任务出错 · 点击标签清除提示",
         };
         let mut slot = div()
-            .id(SharedString::from(format!("agent-status-{id}")))
+            .id(SharedString::from(format!("agent-status-{surface}-{id}")))
             .size(px(14.0))
             .flex_shrink_0()
             .flex()
