@@ -329,8 +329,7 @@ impl Ui {
                         .workspaces
                         .iter()
                         .flat_map(|workspace| &workspace.tabs)
-                        .filter(|tab| !ui.demo && tab.accepts_session_summary()
-                            && !ui.session.terminals.get(&tab.id).is_some_and(|terminal| terminal.detected_agent_pid.is_some()))
+                        .filter(|tab| !ui.demo && tab.accepts_session_summary())
                         .cloned()
                         .collect::<Vec<_>>()
                 }) else {
