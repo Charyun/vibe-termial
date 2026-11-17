@@ -3,10 +3,20 @@ mod acceptance;
 mod activity;
 mod chrome;
 mod clipboard;
+mod context_menu;
 mod conversation;
+mod cursor;
 mod documents;
+#[cfg(all(test, windows))]
+mod keyboard_native_test;
+mod file_drop;
 mod panels;
+mod preview;
+mod resizing;
+#[cfg(all(test, windows))]
+mod wheel_native_test;
 mod ssh;
+mod theme;
 use crate::appearance::{control_icon, icon, profile_icon, profile_icon_sized};
 use crate::render::{self, CELL, INSET, LINE, Snapshot};
 use anyhow::{Result, bail};
@@ -19,6 +29,7 @@ use gpui_kit::{
     *,
 };
 use panels::{PanelTab, ProjectPanel};
+use resizing::ResizePane;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -92,6 +103,7 @@ struct CodePreview {
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
     General,
+    Theme,
     Agents,
     Shortcuts,
     Remote,
@@ -101,6 +113,7 @@ impl SettingsTab {
     fn title(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Theme => "主题",
             Self::Agents => "Agent",
             Self::Shortcuts => "快捷键",
             Self::Remote => "Remote",
@@ -134,6 +147,7 @@ pub struct Ui {
     snapshot: Arc<Snapshot>,
     snapshot_cache: render::SnapshotCache,
     text_cache: RefCell<render::TextCache>,
+    material_appearance: WindowBackgroundAppearance,
     running_terminals: std::collections::HashSet<Uuid>,
     agent_activity: HashMap<Uuid, vibe_terminal::activity::Indicator>,
     bounds: Bounds<Pixels>,
@@ -145,6 +159,7 @@ pub struct Ui {
     path_press: Option<(CellPoint, Point<Pixels>)>,
     preedit: String,
     last_ime_geometry: Option<(Bounds<Pixels>, f32)>,
+    cursor_blink: cursor::CursorBlink,
     settings: bool,
     settings_tab: SettingsTab,
     expanded_workspaces: Vec<Uuid>,
@@ -160,7 +175,7 @@ pub struct Ui {
     preview: Option<PreviewContent>,
     split_preview_owner: Option<Uuid>,
     terminal_preview_width: f32,
-    resizing_terminal_preview: bool,
+    sidebar_width: f32,
     panel: ProjectPanel,
     ssh: ssh::SshUi,
     browser: Rc<RefCell<crate::browser::Browser>>,
@@ -172,17 +187,19 @@ pub struct Ui {
     preview_wrap: bool,
     pending_preview: Option<PreviewAction>,
     preview_width: f32,
-    resize_origin: Option<(Pixels, f32)>,
+    pane_resize: Option<resizing::PaneResize>,
     sender: async_channel::Sender<Event>,
     web_server: Option<vibe_terminal::web::Server>,
     web_tailscale: Option<String>,
     new_menu: Option<(f32, f32)>,
+    _terminal_keys: Subscription,
     _tasks: Vec<Task<()>>,
     pub demo: bool,
 }
 impl Ui {
     pub fn new(mut session: Session, window: &mut Window, cx: &mut Context<Self>) -> Self {
         session.ensure_history();
+        let material_appearance = crate::material::apply(session.data.window_material, window, cx);
         let (sender, receiver) = async_channel::bounded(64);
         let queued = Arc::new(AtomicBool::new(false));
         let wake_sender = sender.clone();
@@ -312,7 +329,8 @@ impl Ui {
                         .workspaces
                         .iter()
                         .flat_map(|workspace| &workspace.tabs)
-                        .filter(|tab| !ui.demo && tab.accepts_session_summary())
+                        .filter(|tab| !ui.demo && tab.accepts_session_summary()
+                            && !ui.session.terminals.get(&tab.id).is_some_and(|terminal| terminal.detected_agent_pid.is_some()))
                         .cloned()
                         .collect::<Vec<_>>()
                 }) else {
@@ -347,11 +365,30 @@ impl Ui {
         });
         let conversations = Self::spawn_conversation_reader(cx);
         let activity = Self::spawn_agent_activity_reader(cx);
+        let cursor_blink = Self::spawn_cursor_blink(window, cx);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let expanded_workspaces = session.data.workspaces.iter().map(|w| w.id).collect();
+        // Kit resolves key bindings before capture_key_down. Bypass those
+        // bindings for terminal control keys so Tab cannot move GUI focus and
+        // Ctrl+C cannot become the root's Copy action. GPUI still delivers the
+        // raw KeyDownEvent, which on_key forwards to the PTY exactly once.
+        let weak = cx.entity().downgrade();
+        let terminal_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            let Some(view) = weak.upgrade() else { return };
+            let ui = view.read(cx);
+            let key = &event.keystroke;
+            if ui.terminal_has_keyboard_focus(window)
+                && key_bytes(&key.key, key.modifiers.control, key.modifiers.alt,
+                    key.modifiers.shift, false).is_some()
+            {
+                cx.stop_propagation();
+            }
+        });
+        let panel = ProjectPanel::for_workspace(&session.data);
         let mut ui = Self {
             session,
+            material_appearance,
             focus,
             snapshot: Arc::default(),
             snapshot_cache: render::SnapshotCache::default(),
@@ -367,6 +404,7 @@ impl Ui {
             path_press: None,
             preedit: String::new(),
             last_ime_geometry: None,
+            cursor_blink: cursor::CursorBlink::default(),
             settings: false,
             settings_tab: SettingsTab::General,
             expanded_workspaces,
@@ -383,8 +421,8 @@ impl Ui {
             preview: None,
             split_preview_owner: None,
             terminal_preview_width: 360.0,
-            resizing_terminal_preview: false,
-            panel: ProjectPanel::default(),
+            sidebar_width: SIDEBAR_WIDTH,
+            panel,
             ssh: ssh::SshUi::default(),
             browser: Rc::new(RefCell::new(crate::browser::Browser::new())),
             preview_request: None,
@@ -395,11 +433,12 @@ impl Ui {
             preview_wrap: true,
             pending_preview: None,
             preview_width: 440.0,
-            resize_origin: None,
+            pane_resize: None,
             sender,
             web_server: None,
             web_tailscale: None,
-            _tasks: vec![events, checkpoint, titles, conversations, activity],
+            _terminal_keys: terminal_keys,
+            _tasks: vec![events, checkpoint, titles, conversations, activity, cursor_blink],
             demo: false,
         };
         ui.refresh();
@@ -478,6 +517,7 @@ impl Ui {
         .detach();
     }
     fn refresh(&mut self) {
+        self.cursor_blink.reset();
         self.refresh_agent_activity();
         self.native_images
             .retain(|_, target| self.session.paste_target_current(target));
@@ -503,7 +543,13 @@ impl Ui {
             };
             if let Some(frame) = frame {
                 // Filesystem probes happen after the PTY buffer guard has dropped.
-                self.snapshot = Arc::new(frame.resolve_links(&w.directory));
+                let snapshot = frame.resolve_links(&w.directory);
+                if snapshot.input_cursor != self.snapshot.input_cursor
+                    || snapshot.cursor != self.snapshot.cursor
+                {
+                    self.cursor_blink.reset();
+                }
+                self.snapshot = Arc::new(snapshot);
                 return true;
             }
             return false;
@@ -565,6 +611,9 @@ impl Ui {
             self.preview_subscription = Some(subscription);
         }
         self.preview = Some(preview);
+        if self.markdown_preview().is_some() {
+            self.focus.focus(window, cx);
+        }
     }
     fn save_preview(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.preview_editing || !self.preview_dirty {
@@ -635,7 +684,7 @@ impl Ui {
                 self.open_file(link);
             }
             PreviewAction::Web(url) => {
-                self.panel.open = true;
+                self.set_project_panel_open(true);
                 self.panel.tab = PanelTab::Explorer;
                 self.clear_preview();
                 if vibe_terminal::paths::is_web_url(&url) {
@@ -743,6 +792,7 @@ impl Ui {
         self.editor = None;
         self.wheel.reset();
         self.session.select_workspace(id);
+        self.sync_project_panel();
         self.preview = None;
         self.preview_request = None;
         self.selection = None;
@@ -924,7 +974,7 @@ impl Ui {
             let name = profile.name.clone();
             let glyph = profile_icon(&profile);
             let category = if profile.kind == CliKind::Shell {
-                "Shell"
+                "终端"
             } else {
                 "Agent"
             };
@@ -1116,12 +1166,12 @@ impl Ui {
             .flex()
             .flex_col()
             .gap_1()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .flex_shrink_0()
             .h_full()
             .px_2()
             .pb_2()
-            .bg(rgb(PANEL))
+            .bg(self.surface_background(PANEL))
             .border_r_1()
             .border_color(rgb(0x303030))
             .child(
@@ -1137,7 +1187,7 @@ impl Ui {
             );
         for tab in [
             SettingsTab::General,
-            SettingsTab::Agents,
+            SettingsTab::Theme,            SettingsTab::Agents,
             SettingsTab::Shortcuts,
             SettingsTab::SshHosts,
             SettingsTab::Remote,
@@ -1153,7 +1203,7 @@ impl Ui {
                     .py_2()
                     .rounded_md()
                     .cursor_pointer()
-                    .bg(rgb(if active { SURFACE } else { PANEL }))
+                    .bg(self.surface_background(if active { SURFACE } else { PANEL }))
                     .text_color(rgb(if active { ACCENT } else { FG }))
                     .on_click(cx.listener(move |s, _, window, cx| {
                         s.select_settings_tab(tab, window, cx);
@@ -1165,6 +1215,7 @@ impl Ui {
         let nav = nav.child(div().flex_1()).child(self.navigation_footer(cx));
         let body = match self.settings_tab {
             SettingsTab::General => self.general_pane(cx),
+            SettingsTab::Theme => self.theme_pane(cx),
             SettingsTab::Agents => self.agents_pane(cx),
             SettingsTab::Shortcuts => self.shortcuts_pane(),
             SettingsTab::Remote => self.web_settings(cx),
@@ -1177,6 +1228,7 @@ impl Ui {
             .min_w_0()
             .min_h_0()
             .child(nav)
+            .child(self.pane_divider(ResizePane::Sidebar, cx))
             .child(
                 div()
                     .id("settings-body")
@@ -1232,6 +1284,18 @@ impl Ui {
                     }),
                 ),
             )
+            .child(
+                gpui_kit::component::switch::Switch::new("right-click-menu-toggle")
+                    .label("启用右键菜单")
+                    .checked(self.session.data.right_click_menu)
+                    .on_click(cx.listener(|ui, enabled: &bool, _, cx| {
+                        ui.set_right_click_menu(*enabled, cx);
+                    })),
+            )
+            .child(
+                div().text_sm().text_color(rgb(MUTED))
+                    .child("开启后，所有终端及文本输入框均可右键打开菜单，进行复制、粘贴等操作。立即生效并自动保存。"),
+            )
             .into_any_element()
     }
     fn agents_pane(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1246,7 +1310,7 @@ impl Ui {
                 div()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(PANEL))
+                    .bg(self.surface_background(PANEL))
                     .text_sm()
                     .text_color(rgb(MUTED))
                     .child("未在本机检测到已安装的 Agent。安装后重新打开设置即可刷新。"),
@@ -1267,7 +1331,7 @@ impl Ui {
                     .gap_3()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(PANEL))
+                    .bg(self.surface_background(PANEL))
                     .child(
                         div()
                             .flex()
@@ -1326,6 +1390,7 @@ impl Ui {
             .flex()
             .flex_col()
             .gap_2()
+            .child("终端聚焦时，Tab、Esc、功能键及 Ctrl 组合键发送给 Shell / Agent；以下界面快捷键仅在终端输入区之外生效。")
             .children(SHORTCUTS.iter().map(|(keys, description)| {
                 div()
                     .flex()
@@ -1528,7 +1593,23 @@ impl Ui {
             cx.write_to_clipboard(ClipboardItem::new_string(self.snapshot.selected_text(a, b)));
         }
     }
+    fn terminal_has_keyboard_focus(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+            && self.session.selected().is_some()
+            && self.active_document.is_none()
+            && !self.content_visible()
+            && !self.settings
+            && self.dialog.is_none()
+            && self.ssh.modal.is_none()
+            && self.new_menu.is_none()
+    }
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_has_keyboard_focus(window) {
+            // Terminal input takes precedence over application shortcuts, including
+            // F1, Ctrl+W/T/Tab and Esc. Plain text stays on the native IME path.
+            self.terminal_key(event, cx);
+            return;
+        }
         let key = event.keystroke.key.as_str();
         if self.ssh.modal.is_some() {
             if key == "escape" {
@@ -1693,6 +1774,11 @@ impl Ui {
             cx.stop_propagation();
             return;
         }
+        self.terminal_key(event, cx);
+    }
+    fn terminal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let m = event.keystroke.modifiers;
         let cursor = self
             .session
             .selected()
@@ -1705,6 +1791,7 @@ impl Ui {
             })
             .unwrap_or(false);
         if let Some(bytes) = key_bytes(key, m.control, m.alt, m.shift, cursor) {
+            self.cursor_blink.reset();
             let has_image = self
                 .session
                 .selected()
@@ -1812,12 +1899,18 @@ impl Ui {
             self.snapshot.rows,
             self.snapshot.cols,
         );
+        let has_link = self.snapshot.link_at(point.0, point.1).is_some()
+            || self.snapshot.web_link_at(point.0, point.1).is_some();
         let primary = if cfg!(target_os = "macos") {
             event.modifiers.platform
         } else {
             event.modifiers.control
         };
-        if primary {
+        // 终端中的连接/文件路径：默认鼠标点击走当前逻辑（预览）；点击文本走选中逻辑。
+        if has_link {
+            self.path_press = Some((point, event.position));
+            self.selecting = false;
+        } else if primary {
             self.path_press = Some((point, event.position));
             self.selecting = false;
         } else if !event.modifiers.shift
@@ -1846,17 +1939,6 @@ impl Ui {
         self.terminal_pointer = Some(event.position);
         if previous_cursor != self.terminal_cursor() {
             cx.notify();
-        }
-        if let Some((origin, width)) = self.resize_origin {
-            if self.resizing_terminal_preview {
-                self.terminal_preview_width =
-                    (width - f32::from(event.position.x - origin)).clamp(120.0, 800.0);
-            } else {
-                self.preview_width =
-                    (width - f32::from(event.position.x - origin)).clamp(280.0, 800.0);
-            }
-            cx.notify();
-            return;
         }
         if let Some((id, previous)) = self.mouse_capture {
             let point = render::cell_at(
@@ -1939,7 +2021,6 @@ impl Ui {
     }
     fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.selecting = false;
-        self.resize_origin = None;
         if let Some((id, _)) = self.mouse_capture.take() {
             let point = render::cell_at(
                 event.position,
@@ -1968,7 +2049,18 @@ impl Ui {
                     self.request_preview_action(PreviewAction::File(link), window, cx);
                     cx.notify();
                 } else if let Some(link) = self.snapshot.web_link_at(point.0, point.1) {
-                    self.request_preview_action(PreviewAction::Web(link.url.clone()), window, cx);
+                    let ctrl = if cfg!(target_os = "macos") {
+                        event.modifiers.platform
+                    } else {
+                        event.modifiers.control
+                    };
+                    if ctrl {
+                        // Ctrl+点击网页链接：走系统默认打开方式（外部浏览器）。
+                        cx.open_url(&link.url);
+                    } else {
+                        // 默认点击：走当前软件逻辑（内置网页预览）。
+                        self.request_preview_action(PreviewAction::Web(link.url.clone()), window, cx);
+                    }
                     cx.notify();
                 }
             }
@@ -2029,12 +2121,11 @@ impl Ui {
             .selected()
             .and_then(|id| self.session.terminals.get(&id))
         {
-            if self.snapshot.alternate && t.running() && !event.modifiers.shift {
-                let count = lines.unsigned_abs().min(100);
-                let sequence = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
-                let result = t.send(sequence.repeat(count));
-                self.session.result(result);
-            } else if let Ok(mut b) = t.buffer.lock() {
+            // An alternate screen alone does not mean the application wants
+            // arrow keys. Without mouse tracking, keep wheel input local: a
+            // shell-launched Agent may not have been identified by the worker
+            // yet, and synthesized arrows would edit/navigate its prompt.
+            if let Ok(mut b) = t.buffer.lock() {
                 b.scroll_lines(lines);
             }
         }
@@ -2100,6 +2191,7 @@ impl Ui {
                         }))
                         .child(div().min_w_0().truncate().child(workspace.name.clone())),
                 )
+                .children(self.workspace_activity_indicator(workspace))
                 .child(Self::tool_button(
                     SharedString::from(format!("workspace-settings-{id}")),
                     "项目设置",
@@ -2132,7 +2224,6 @@ impl Ui {
                                 s.open_tab(id, tab_id, w, cx);
                                 cx.notify();
                             }))
-                            .children(self.agent_activity_indicator(tab_id, "sidebar"))
                             .child(profile_icon_sized(&tab.profile, px(14.0)))
                             .child(
                                 div()
@@ -2140,7 +2231,8 @@ impl Ui {
                                     .min_w_0()
                                     .truncate()
                                     .child(tab.display_title().to_owned()),
-                            ),
+                            )
+                            .children(self.agent_activity_indicator(tab_id, "sidebar")),
                     );
                 }
                 group = group.child(sessions);
@@ -2148,14 +2240,14 @@ impl Ui {
             list = list.child(group);
         }
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
             .px_2()
             .pb_2()
-            .bg(rgb(PANEL))
+            .bg(self.surface_background(PANEL))
             .border_r_1()
             .border_color(rgb(0x303030))
             .child(
@@ -2224,9 +2316,14 @@ impl Ui {
                 .overflow_hidden()
                 .track_focus(&self.focus)
                 .key_context("VibeTerminal")
+                .on_drop(cx.listener(Self::drop_terminal_files))
                 .cursor(self.terminal_cursor())
                 .on_hover(cx.listener(Self::terminal_hover))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+                .on_mouse_up(MouseButton::Right, cx.listener(Self::terminal_context_menu))
+                .on_action(cx.listener(Self::context_copy_terminal))
+                .on_action(cx.listener(Self::context_paste_terminal))
+                .on_action(cx.listener(Self::context_select_terminal))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
                 .on_mouse_move(cx.listener(Self::mouse_move))
@@ -2241,7 +2338,7 @@ impl Ui {
             .items_center()
             .h(px(40.0))
             .flex_shrink_0()
-            .bg(rgb(PANEL))
+            .bg(self.surface_background(PANEL))
             .px_3()
             .gap_2()
             .child(Self::button("web-back", "←", cx, |s, _, _| {
@@ -2320,7 +2417,7 @@ impl Ui {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .bg(rgb(BG))
+            .bg(self.surface_background(BG))
             .child(header)
             .child(address);
         if let Some(error) = &web.error {
@@ -2436,7 +2533,7 @@ impl Ui {
             .h(px(40.0))
             .flex_shrink_0()
             .text_xs()
-            .bg(rgb(PANEL))
+            .bg(self.surface_background(PANEL))
             .px_3()
             .gap_2()
             .child(
@@ -2468,7 +2565,7 @@ impl Ui {
             );
         if self.preview_editor.is_some() {
             toolbar = toolbar
-                .child(Self::button(
+                .children(self.markdown_preview().is_none().then(|| Self::button(
                     "wrap-preview",
                     if self.preview_wrap {
                         "换行：开"
@@ -2485,7 +2582,7 @@ impl Ui {
                             });
                         }
                     },
-                ))
+                )))
                 .child(Self::button(
                     "edit-preview",
                     if self.preview_editing {
@@ -2494,16 +2591,7 @@ impl Ui {
                         "编辑"
                     },
                     cx,
-                    |s, w, cx| {
-                        if s.preview_editing && !s.save_preview(cx) {
-                            return;
-                        }
-                        s.preview_editing = !s.preview_editing;
-                        if let Some(input) = &s.preview_editor {
-                            input.update(cx, |state, cx| state.focus(w, cx));
-                        }
-                        cx.notify();
-                    },
+                    |s, w, cx| s.toggle_preview_editing(w, cx),
                 ));
         }
         toolbar = toolbar.child(Self::button(
@@ -2515,7 +2603,9 @@ impl Ui {
             },
             cx,
             |s, _, cx| {
-                let text = if let Some(input) = &s.preview_editor {
+                let text = if let Some(markdown) = s.markdown_preview() {
+                    Some(markdown.file.content.clone())
+                } else if let Some(input) = &s.preview_editor {
                     let state = input.read(cx);
                     let selected = state.selected_value();
                     Some(if selected.is_empty() {
@@ -2539,7 +2629,7 @@ impl Ui {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .bg(rgb(BG))
+            .bg(self.surface_background(BG))
             .child(header.child(Self::tool_button(
                 "close-preview",
                 "关闭文件预览",
@@ -2580,7 +2670,21 @@ impl Ui {
                     );
             }
             Some(PreviewContent::Code(_)) => {
-                if let Some(input) = &self.preview_editor {
+                if let Some(markdown) = self.markdown_preview() {
+                    pane = pane.child(
+                        div()
+                            .id("markdown-file-preview")
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .p_4()
+                            .child(gpui_kit::component::text::TextView::markdown(
+                                SharedString::from(format!("markdown-preview-{}", markdown.file.path.display())),
+                                markdown.file.content.clone(),
+                            ).selectable(true).scrollable(false)),
+                    );
+                } else if let Some(input) = &self.preview_editor {
                     pane = pane.child(
                         div()
                             .flex_1()
@@ -2723,9 +2827,7 @@ impl Render for Ui {
         {
             self.browser.borrow_mut().hide();
         }
-        self.preview_width = self
-            .preview_width
-            .min((f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 324.0).max(280.0));
+        self.sync_pane_widths(window);
         let mut content = div()
             .flex()
             .flex_col()
@@ -2733,7 +2835,7 @@ impl Render for Ui {
             .min_w_0()
             .min_h_0()
             .h_full()
-            .bg(rgb(BG));
+            .bg(self.surface_background(BG));
         if self.settings {
             content = content.child(self.settings_page(cx));
         } else if self.session.data.workspace().is_some() {
@@ -2745,24 +2847,7 @@ impl Render for Ui {
                 .child(self.main_area(window, cx));
             if self.panel.open {
                 work = work
-                    .child(
-                        div()
-                            .id("preview-divider")
-                            .w(px(4.0))
-                            .h_full()
-                            .flex_shrink_0()
-                            .bg(rgb(0x30362b))
-                            .hover(|s| s.bg(rgb(ACCENT)))
-                            .cursor(CursorStyle::ResizeLeftRight)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|s, event: &MouseDownEvent, _, cx| {
-                                    s.resizing_terminal_preview = false;
-                                    s.resize_origin = Some((event.position.x, s.preview_width));
-                                    cx.stop_propagation();
-                                }),
-                            ),
-                    )
+                    .child(self.pane_divider(ResizePane::Right, cx))
                     .child(self.right_panel(window, cx));
             }
             content = content.child(work);
@@ -2820,8 +2905,10 @@ impl Render for Ui {
             .font_family("Geist")
             .text_size(px(14.0))
             .text_color(rgb(FG))
-            .bg(rgb(BG))
+            .bg(crate::material::base_tint(self.material_appearance))
             .capture_key_down(cx.listener(Self::on_key))
+            .capture_any_mouse_down(cx.listener(Self::gate_right_mouse_down))
+            .capture_any_mouse_up(cx.listener(Self::gate_right_mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .child(self.title_bar(window, cx))
@@ -2832,12 +2919,14 @@ impl Render for Ui {
                     .min_h_0()
                     .min_w_0()
                     .children((!self.settings).then(|| self.sidebar(cx)))
+                    .children((!self.settings).then(|| self.pane_divider(ResizePane::Sidebar, cx)))
                     .child(content),
             )
             .child(self.status_bar())
             .children(self.dialog.as_ref().map(|_| self.dialog_view(cx)))
             .children(self.ssh.modal.as_ref().map(|_| self.ssh_dialog_view(cx)))
             .children(self.new_menu.map(|_| self.new_terminal_menu(cx)))
+            .child(self.pane_resize_listener(cx))
     }
 }
 
@@ -2892,6 +2981,7 @@ impl Element for TerminalSurface {
                 ui.session.resize(rows, cols);
                 ui.refresh();
             }
+            ui.update_cursor_blink(window);
             let ime_geometry = if ui.focus.is_focused(window) && ui.dialog.is_none() {
                 ui.snapshot
                     .ime_bounds(bounds, &ui.preedit, ui.preedit.encode_utf16().count())
@@ -2922,6 +3012,7 @@ impl Element for TerminalSurface {
             &ui.preedit,
             ui.session.data.input_cursor_style,
             focused,
+            ui.cursor_blink.visible(),
             &mut ui.text_cache.borrow_mut(),
             window,
         )
@@ -3007,6 +3098,7 @@ impl EntityInputHandler for Ui {
             && self.active_document.is_none()
             && !self.content_visible()
         {
+            self.cursor_blink.reset();
             self.session.send(value.as_bytes().to_vec());
             self.selection = None;
         }
@@ -3021,6 +3113,7 @@ impl EntityInputHandler for Ui {
         cx: &mut Context<Self>,
     ) {
         self.preedit = value.into();
+        self.cursor_blink.reset();
         cx.notify();
     }
     fn bounds_for_range(
@@ -3114,6 +3207,8 @@ fn key_bytes(
                 _ => return None,
             }
         }
+        k if control && matches!(k, "space" | "@" | "2") => vec![0],
+        k if control && matches!(k, "/" | "?") => vec![31],
         k if control && k.len() == 1 => {
             let c = k.as_bytes()[0].to_ascii_uppercase();
             if (b'@'..=b'_').contains(&c) {
@@ -3400,6 +3495,22 @@ mod tests {
         );
         assert_eq!(key_bytes("c", true, false, false, false).unwrap(), [3]);
         assert!(key_bytes("a", false, false, false, false).is_none());
+    }
+    #[test]
+    fn terminal_tab_escape_and_shell_shortcuts_are_encoded() {
+        for (key, control, shift, expected) in [
+            ("tab", false, false, &b"\t"[..]),
+            ("tab", false, true, &b"\x1b[Z"[..]),
+            ("escape", false, false, &b"\x1b"[..]),
+            ("f1", false, false, &b"\x1bOP"[..]),
+            ("w", true, false, &b"\x17"[..]),
+            ("t", true, false, &b"\x14"[..]),
+            ("v", true, false, &b"\x16"[..]),
+            ("space", true, false, &b"\0"[..]),
+            ("/", true, false, &b"\x1f"[..]),
+        ] {
+            assert_eq!(key_bytes(key, control, false, shift, false).unwrap(), expected);
+        }
     }
     #[test]
     fn preview_loads_unicode_and_target_location() {
