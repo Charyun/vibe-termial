@@ -1228,7 +1228,7 @@ impl Ui {
             .min_w_0()
             .min_h_0()
             .child(nav)
-            .child(self.pane_divider(ResizePane::Sidebar, cx))
+            .child(self.pane_divider_static(cx))
             .child(
                 div()
                     .id("settings-body")
