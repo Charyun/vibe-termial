@@ -79,7 +79,16 @@ impl FileLinkResolver {
             let cleaned = cleaned.strip_suffix('.').unwrap_or(cleaned);
             let offset = raw.find(cleaned).unwrap_or(0);
             let (base, line, column) = split_location(cleaned);
-            let base = base.trim_matches(['"', '\'', '`']);
+            let mut base = base.to_string();
+            if !std::path::Path::new(&base).is_file() {
+                let mut trimmed = base.clone();
+                while !trimmed.is_empty() && !std::path::Path::new(&trimmed).is_file() {
+                    trimmed.pop();
+                }
+                if !trimmed.is_empty() {
+                    base = trimmed;
+                }
+            }
             if base.is_empty() || base.contains("://") {
                 continue;
             }
