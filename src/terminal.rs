@@ -175,6 +175,8 @@ pub struct Terminal {
     pub dirty: Arc<AtomicBool>,
     pub ended: Arc<AtomicBool>,
     pub interrupt_sent: AtomicBool,
+    pub shell_profile: Option<crate::model::CliProfile>,
+    pub detected_agent_pid: Option<u32>,
     input: Option<SyncSender<Vec<u8>>>,
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
@@ -196,6 +198,8 @@ impl Terminal {
             dirty: Arc::new(AtomicBool::new(true)),
             ended: Arc::new(AtomicBool::new(false)),
             interrupt_sent: AtomicBool::new(false),
+            shell_profile: None,
+            detected_agent_pid: None,
             input: None,
             master: None,
             child: None,
@@ -356,6 +360,8 @@ impl Terminal {
             dirty,
             ended,
             interrupt_sent: AtomicBool::new(false),
+            shell_profile: (tab.profile.kind == CliKind::Shell).then(|| tab.profile.clone()),
+            detected_agent_pid: None,
             input: Some(tx),
             master: Some(pair.master),
             child: Some(child),
@@ -396,6 +402,9 @@ impl Terminal {
             buffer.parser.callbacks_mut().cwd = path;
             buffer.revision = buffer.revision.wrapping_add(1);
         }
+    }
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|child| child.process_id())
     }
     pub fn running(&self) -> bool {
         self.child.is_some() && !self.ended.load(Ordering::Acquire)
@@ -584,6 +593,20 @@ fn shim_entry(contents: &str) -> Option<&str> {
         .map(|entry| entry.as_str())
 }
 
+/// 只接受直接转发全部参数的原生启动行，避免把脚本里的条件检查当作入口。
+#[cfg(windows)]
+fn native_shim_entry(contents: &str) -> Option<&str> {
+    use std::sync::OnceLock;
+    static NATIVE_ENTRY: OnceLock<regex::Regex> = OnceLock::new();
+    let re = NATIVE_ENTRY.get_or_init(|| {
+        regex::Regex::new(r#"(?im)^[ \t]*@?"%~?dp0%?[\\/]?([^"%\r\n]+\.exe)"[ \t]+%\*[ \t]*\r?$"#)
+            .expect("native shim entry regex")
+    });
+    re.captures(contents)
+        .and_then(|captures| captures.get(1))
+        .map(|entry| entry.as_str())
+}
+
 fn command_builder(command: &str) -> Result<CommandBuilder> {
     #[cfg(windows)]
     {
@@ -608,6 +631,13 @@ fn command_builder(command: &str) -> Result<CommandBuilder> {
                 // npm 与 cmd-shim 生成的启动脚本会写明 JS 入口；直接交给 Node 执行，
                 // 让引号和元字符保持字面量，而不是变成 cmd.exe 的语法。
                 let contents = std::fs::read_to_string(&path)?;
+                if let Some(entry) = native_shim_entry(&contents) {
+                    let directory = path.parent().context("CLI 路径缺少父目录")?;
+                    let entry = directory.join(entry.trim_start_matches(char::from(92)).trim_start_matches('/'));
+                    if entry.is_file() {
+                        return Ok(CommandBuilder::new(entry));
+                    }
+                }
                 if let Some(entry) = shim_entry(&contents) {
                     let directory = path.parent().context("CLI 路径缺少父目录")?;
                     let entry = directory.join(entry);
@@ -745,6 +775,51 @@ mod tests {
                 .contains("world")
         );
     }
+    #[cfg(windows)]
+    #[test]
+    fn native_shim_entry_only_accepts_direct_argument_forwarding() {
+        assert_eq!(native_shim_entry("\"%~dp0bin\\tool.exe\" %*\r\n"), Some(r"bin\tool.exe"));
+        assert_eq!(native_shim_entry("IF EXIST \"%dp0%\\node.exe\" (\r\n"), None);
+        assert_eq!(native_shim_entry("\"%dp0%\\tool.exe\" --required %*\r\n"), None);
+        assert_eq!(native_shim_entry("\"%dp0%\\tool.exe\" %* & echo extra\r\n"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_builder_supports_native_npm_launcher() {
+        let root = std::env::temp_dir().join(format!("vibe-native-shim-{}", uuid::Uuid::new_v4()));
+        let entry = root.join(r"node_modules\@opencode\cli\bin\opencode.exe");
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(&entry, b"").unwrap();
+        let launcher = root.join("opencode.cmd");
+        std::fs::write(&launcher, "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe\"   %*\r\n").unwrap();
+        let result = command_builder(launcher.to_str().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut builder = result.expect("原生 npm 启动器应直接解析为 exe");
+        builder.arg("literal & argument");
+        assert_eq!(builder.get_argv(), &vec![entry.into_os_string(), "literal & argument".into()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_builder_preserves_js_launchers_and_rejects_missing_native_entries() {
+        let root = std::env::temp_dir().join(format!("vibe-js-shim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let entry = root.join("cli.js");
+        let node = root.join("node.exe");
+        std::fs::write(&entry, b"").unwrap();
+        std::fs::write(&node, b"").unwrap();
+        let launcher = root.join("tool.cmd");
+        std::fs::write(&launcher, "\"%dp0%\\node.exe\" \"%dp0%\\cli.js\" %*\r\n").unwrap();
+        let builder = command_builder(launcher.to_str().unwrap()).unwrap();
+        assert_eq!(builder.get_argv(), &vec![node.into_os_string(), entry.into_os_string()]);
+        std::fs::write(&launcher, "\"%dp0%\\missing.exe\" %*\r\n").unwrap();
+        assert!(command_builder(launcher.to_str().unwrap()).is_err());
+        std::fs::write(&launcher, "@echo arbitrary script\r\n").unwrap();
+        assert!(command_builder(launcher.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn shim_entry_reads_cmd_shim_and_pi_launcher_styles() {
