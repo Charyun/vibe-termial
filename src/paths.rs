@@ -79,6 +79,9 @@ impl FileLinkResolver {
             let cleaned = cleaned.strip_suffix('.').unwrap_or(cleaned);
             let offset = raw.find(cleaned).unwrap_or(0);
             let (base, line, column) = split_location(cleaned);
+            // 引号包裹的路径按文件链接处理：先去掉两端的引号，再退回“向前截断到
+            // 存在的文件”，否则 pop 循环永远不会把开头的引号去掉。
+            let base = base.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
             let mut base = base.to_string();
             if !std::path::Path::new(&base).is_file() {
                 let mut trimmed = base.clone();
