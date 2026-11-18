@@ -298,18 +298,18 @@ impl Ui {
             }
         });
         let checkpoint = cx.spawn(async move |weak, cx| {
-            let mut seconds = 0;
             loop {
                 smol::Timer::after(Duration::from_secs(2)).await;
-                seconds += 2;
                 if weak
                     .update(cx, |ui, _| {
                         if !ui.demo {
                             ui.session.capture_metadata();
-                            if seconds % 10 == 0
-                                && ui.session.terminals.values().any(|t| t.loaded())
-                            {
+                            // 每 2 秒落盘一次，保证闪退前的会话 ID、
+                            // 标签顺序与终端名称都能恢复。
+                            if ui.session.terminals.values().any(|t| t.loaded()) {
                                 ui.session.checkpoint();
+                            } else {
+                                ui.session.persist();
                             }
                         }
                     })
