@@ -250,7 +250,10 @@ impl Terminal {
         cmd.cwd(crate::paths::local_path(&tab.cwd));
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        if tab.profile.kind == CliKind::Pi {
+        // Pi 只有收到终端对它 `OSC 7501;?` 询问的应答后才会上报状态，而 Windows
+        // ConPTY 会吞掉我们注入的应答，导致在 VibeTerm 的 shell 里手动启动的 Pi
+        // 完全没有状态。直接告诉任何从这里启动的 Pi 原生支持状态上报。
+        if matches!(tab.profile.kind, CliKind::Pi | CliKind::Shell) {
             cmd.env("PI_PROGRAM_STATUS", "1");
         }
         #[cfg(windows)]
