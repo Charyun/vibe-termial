@@ -1,4 +1,7 @@
 //! Terminal grid data and GPUI painting. All hit testing uses terminal cells.
+#[cfg(all(test, windows))]
+#[path = "cursor_native_test.rs"]
+mod cursor_native_test;
 use gpui_kit::*;
 use std::path::Path;
 use vibe_terminal::{
@@ -39,7 +42,6 @@ pub struct Snapshot {
     pub cursor: Option<(u16, u16)>,
     /// Real terminal caret, retained even when a TUI hides the painted cursor.
     pub input_cursor: Option<(u16, u16)>,
-    pub alternate: bool,
 }
 /// The PTY lock is needed only to copy visible terminal cells. Resolve paths
 /// after releasing it so filesystem latency cannot stall the PTY reader.
@@ -169,7 +171,6 @@ impl Snapshot {
         let mut out = Self {
             rows,
             cols,
-            alternate: screen.alternate_screen(),
             ..Self::default()
         };
         for row in 0..rows {
@@ -386,6 +387,7 @@ pub fn prepare(
     preedit: &str,
     cursor_style: InputCursorStyle,
     focused: bool,
+    cursor_visible: bool,
     text_cache: &mut TextCache,
     window: &mut Window,
 ) -> PaintState {
@@ -447,6 +449,7 @@ pub fn prepare(
             };
             let text: SharedString = run.text.clone().into();
             let foreground = if focused
+                && cursor_visible
                 && cursor_style == InputCursorStyle::Block
                 && snapshot.cursor == Some((run.row, run.col))
             {
@@ -531,7 +534,7 @@ pub fn prepare(
             ));
         }
     }
-    if focused && let Some((row, col)) = snapshot.cursor {
+    if focused && cursor_visible && let Some((row, col)) = snapshot.cursor {
         let width = if cursor_style == InputCursorStyle::Bar {
             2.0
         } else {

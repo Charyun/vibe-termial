@@ -1,4 +1,10 @@
 #[cfg(all(test, windows))]
+#[path = "file_drop_native_test.rs"]
+mod file_drop_native_test;
+#[cfg(all(test, windows))]
+#[path = "context_menu_native_test.rs"]
+mod context_menu_native_test;
+#[cfg(all(test, windows))]
 #[path = "clipboard_native_test.rs"]
 mod clipboard_native_test;
 #[cfg(all(test, windows))]
@@ -31,6 +37,28 @@ pub(super) struct ConversationView {
 }
 
 impl Ui {
+    pub(super) fn drop_composer_files(
+        &mut self,
+        id: Uuid,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session.selected() != Some(id)
+            || !self.conversations.get(&id).is_some_and(|view| view.visible && !view.sending)
+        {
+            return;
+        }
+        let Some(text) = self.dropped_paths_text(paths, cx) else { return };
+        if let Some(view) = self.conversations.get_mut(&id) {
+            view.input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace(text, window, cx);
+            });
+            view.notice = None;
+        }
+        cx.notify();
+    }
     pub(super) fn composer_image_epoch(&self, id: Uuid, entity: EntityId) -> Option<u64> {
         self.conversations
             .get(&id)
@@ -232,6 +260,9 @@ impl Ui {
                     ui.session
                         .selected()
                         .and_then(|id| ui.session.data.tab(id))
+                        // Shell-launched Agents don't use our managed log paths.
+                        .filter(|tab| !ui.session.terminals.get(&tab.id)
+                            .is_some_and(|terminal| terminal.detected_agent_pid.is_some()))
                         .cloned()
                         .map(|tab| (tab, ui.session.store.root.clone()))
                 }) else {
@@ -570,7 +601,7 @@ impl Ui {
             .flex_col()
             .gap_2()
             .p_3()
-            .bg(rgb(PANEL))
+            .bg(self.surface_background(PANEL))
             .children(has_image.then(|| {
                 div()
                     .flex()
@@ -595,7 +626,13 @@ impl Ui {
                     .map(|notice| div().text_xs().text_color(rgb(MUTED)).child(notice.clone())),
             )
             .child(
-                Textarea::new(&view.input)
+                div()
+                    .id("conversation-file-drop")
+                    .w_full()
+                    .on_drop(cx.listener(move |ui, paths: &ExternalPaths, window, cx| {
+                        ui.drop_composer_files(id, paths, window, cx);
+                    }))
+                    .child(Textarea::new(&view.input)
                     .disabled(!running || view.sending)
                     .on_paste(move |clipboard, _, cx| {
                         paste_owner
@@ -614,7 +651,7 @@ impl Ui {
                                 )
                             })
                             .unwrap_or(false)
-                    }),
+                    })),
             )
             .child(actions);
         div()
@@ -630,7 +667,7 @@ impl Ui {
                     .gap_3()
                     .px_4()
                     .py_2()
-                    .bg(rgb(PANEL))
+                    .bg(self.surface_background(PANEL))
                     .child(
                         div()
                             .flex_1()

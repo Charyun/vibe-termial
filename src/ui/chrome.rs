@@ -1,5 +1,8 @@
 use super::*;
 
+// Keep the conversation implementation available while hiding its title-bar entry.
+const SHOW_TRANSCRIPT_ENTRY: bool = false;
+
 impl Ui {
     pub(super) fn tab_separator() -> AnyElement {
         div()
@@ -13,7 +16,7 @@ impl Ui {
     }
     pub(super) fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let brand = div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width + resizing::DIVIDER))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -25,7 +28,7 @@ impl Ui {
                 div()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Vibe Terminal"),
+                    .child("VibeTerm"),
             );
         let mut strip = div()
             .id("tab-strip")
@@ -52,7 +55,7 @@ impl Ui {
                         .h_full()
                         .flex_shrink_0()
                         .relative()
-                        .bg(rgb(if active { BG } else { PANEL }))
+                        .bg(self.surface_background(if active { BG } else { PANEL }))
                         .border_t_1()
                         .border_color(rgb(if active { 0x8b9c89 } else { PANEL }))
                         .child(Self::tab_separator())
@@ -156,7 +159,7 @@ impl Ui {
                                 CliKind::Pi | CliKind::Codex | CliKind::Claude
                             )
                         }));
-            if transcript_ready {
+            if SHOW_TRANSCRIPT_ENTRY && transcript_ready {
                 tools = tools.child(
                     Self::tool_button(
                         "toggle-transcript",
@@ -182,11 +185,10 @@ impl Ui {
                     self.panel.open,
                     cx,
                     |s, w, cx| {
-                        s.panel.open = !s.panel.open;
+                        s.set_project_panel_open(!s.panel.open);
                         if !s.panel.open {
                             s.focus.focus(w, cx);
                         }
-                        s.sync_project_panel();
                         cx.notify();
                     },
                 )
@@ -213,7 +215,7 @@ impl Ui {
             .h(px(40.0))
             .pl(px(if cfg!(target_os = "macos") { 80.0 } else { 0.0 }))
             .pr_0()
-            .bg(rgb(PANEL))
+            .bg(self.surface_background(PANEL))
             .border_color(rgb(0x303030))
             .child(contents)
             .into_any_element()
@@ -310,7 +312,7 @@ impl Ui {
             .items_center()
             .gap_3()
             .px_3()
-            .bg(rgb(PANEL))
+            .bg(self.surface_background(PANEL))
             .border_t_1()
             .border_color(rgb(0x30362b))
             .text_xs()
@@ -323,7 +325,7 @@ impl Ui {
             )
             .child(
                 tab.map(|t| t.profile.name.clone())
-                    .unwrap_or_else(|| "Vibe Terminal".into()),
+                    .unwrap_or_else(|| "VibeTerm".into()),
             )
             .child(
                 div()

@@ -48,7 +48,21 @@ impl Session {
     }
     pub fn persist(&mut self) {
         if !self.read_only {
-            let r = self.store.save(&self.data);
+            // Shell-launched Agents have no managed resume binding. Persist the
+            // original shell so reopening never resumes an unrelated conversation.
+            let mut data = self.data.clone();
+            for (id, terminal) in &self.terminals {
+                if terminal.detected_agent_pid.is_some()
+                    && let Some(shell) = &terminal.shell_profile
+                    && let Some(tab) = data.tab_mut(*id)
+                {
+                    tab.profile = shell.clone();
+                    if !tab.title_is_manual { tab.title = shell.name.clone(); }
+                    tab.session_id = None;
+                    tab.session_summary = None;
+                }
+            }
+            let r = self.store.save(&data);
             self.result(r);
         }
     }
@@ -249,6 +263,36 @@ impl Session {
             }
         }
     }
+    /// Collect immutable runtime tokens before probing on a worker thread.
+    pub fn shell_processes(&self) -> Vec<(Uuid, Uuid, u32)> {
+        if self.read_only || self.stopped { return Vec::new(); }
+        self.terminals.iter().filter_map(|(id, terminal)| {
+            if terminal.shell_profile.is_none() || !terminal.running() || self.data.is_remote_tab(*id) { return None; }
+            Some((*id, terminal.buffer.lock().ok()?.runtime_id, terminal.process_id()?))
+        }).collect()
+    }
+    pub fn apply_running_agent(
+        &mut self, id: Uuid, runtime: Uuid, root_pid: u32,
+        agent: Option<crate::running_agent::RunningAgent>,
+    ) -> bool {
+        let Some(terminal) = self.terminals.get_mut(&id) else { return false; };
+        if terminal.process_id() != Some(root_pid) || !terminal.running() { return false; }
+        let Some(shell) = terminal.shell_profile.clone() else { return false; };
+        let Ok(mut buffer) = terminal.buffer.lock() else { return false; };
+        if buffer.runtime_id != runtime { return false; }
+        let next_pid = agent.as_ref().map(|agent| agent.pid);
+        if terminal.detected_agent_pid == next_pid { return false; }
+        let Some(tab) = self.data.tab_mut(id) else { return false; };
+        terminal.detected_agent_pid = next_pid;
+        tab.profile = agent.map(|agent| agent.profile).unwrap_or(shell);
+        if !tab.title_is_manual { tab.title = tab.profile.name.clone(); }
+        tab.session_summary = None;
+        tab.session_id = None;
+        tab.conversation_generation = tab.conversation_generation.wrapping_add(1);
+        buffer.parser.callbacks_mut().activity = Default::default();
+        terminal.interrupt_sent.store(false, Ordering::Release);
+        true
+    }
     /// Ctrl+C may only interrupt a turn. Return to a shell only after the
     /// corresponding local Agent process has actually exited, never on restore failure.
     pub fn return_exited_agents_to_shell(&mut self) -> Vec<Uuid> {
@@ -417,7 +461,7 @@ impl Session {
         if let Some(terminal) = self
             .terminals
             .get(&id)
-            .filter(|terminal| terminal.running())
+            .filter(|terminal| terminal.running() && terminal.detected_agent_pid.is_none())
             && let Ok(mut buffer) = terminal.buffer.lock()
         {
             buffer.parser.callbacks_mut().activity.submitted();
@@ -434,6 +478,7 @@ impl Session {
             let submit = bytes == b"\r";
             let interrupt = bytes == b"\x1b" || bytes == b"\x03";
             let codex = (submit || interrupt)
+                && t.detected_agent_pid.is_none()
                 && !self.data.is_remote_tab(id)
                 && self
                     .data
@@ -510,7 +555,9 @@ impl Session {
             .filter(|w| w.remote.is_none())
             .flat_map(|w| &mut w.tabs)
         {
-            if tab.profile.kind != CliKind::Codex {
+            if tab.profile.kind != CliKind::Codex
+                || self.terminals.get(&tab.id).is_some_and(|terminal| terminal.detected_agent_pid.is_some())
+            {
                 continue;
             }
             let path = self

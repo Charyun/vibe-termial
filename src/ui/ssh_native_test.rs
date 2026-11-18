@@ -1,3 +1,32 @@
+async fn capture_workspace_modal(name: &str) {
+    let Some(root) = std::env::var_os("VIBE_WORKSPACE_CAPTURE_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    std::fs::create_dir_all(&root).unwrap();
+    let output = root.join(format!("{name}.png"));
+    let result = smol::unblock(move || {
+        std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-File",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/capture-window.ps1"),
+                "-ClientProcessId",
+                &std::process::id().to_string(),
+                "-OutputFile",
+            ])
+            .arg(output)
+            .output()
+    })
+    .await
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "capture failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 #[cfg(windows)]
 #[test]
 #[ignore = "opens an isolated native SSH host/workspace form; does not connect to external hosts"]
@@ -54,6 +83,7 @@ fn native_ssh_host_and_workspace_forms() {
                     })
                     .unwrap();
                 smol::Timer::after(Duration::from_millis(150)).await;
+                capture_workspace_modal("local-workspace").await;
                 handle
                     .update(cx, |_, window, cx| {
                         view.update(cx, |ui, cx| {
@@ -124,6 +154,7 @@ fn native_ssh_host_and_workspace_forms() {
                     })
                     .unwrap();
                 smol::Timer::after(Duration::from_millis(200)).await;
+                capture_workspace_modal("remote-workspace").await;
                 handle
                     .update(cx, |_, window, cx| {
                         view.update(cx, |ui, cx| {

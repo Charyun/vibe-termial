@@ -243,6 +243,8 @@ pub struct Workspace {
     pub tabs: Vec<Tab>,
     pub selected_tab: Option<Uuid>,
     #[serde(default)]
+    pub right_panel_open: bool,
+    #[serde(default)]
     pub remote: Option<crate::ssh::SshProject>,
 }
 
@@ -252,6 +254,15 @@ pub enum InputCursorStyle {
     #[default]
     Block,
     Bar,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowMaterial {
+    #[default]
+    Mica,
+    MicaAlt,
+    Acrylic,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -266,8 +277,20 @@ pub struct AppData {
     #[serde(default)]
     pub input_cursor_style: InputCursorStyle,
     #[serde(default)]
+    pub window_material: WindowMaterial,
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    #[serde(default = "default_right_panel_width")]
+    pub right_panel_width: f32,
+    /// 控制终端与文本输入框的右键菜单，旧配置默认关闭。
+    #[serde(default)]
+    pub right_click_menu: bool,
+    #[serde(default)]
     pub ssh_hosts: Vec<crate::ssh::SshHost>,
 }
+
+fn default_sidebar_width() -> f32 { 224.0 }
+fn default_right_panel_width() -> f32 { 440.0 }
 
 impl Default for AppData {
     fn default() -> Self {
@@ -278,6 +301,10 @@ impl Default for AppData {
             profiles: CliProfile::defaults(),
             disabled_agents: vec![],
             input_cursor_style: InputCursorStyle::default(),
+            window_material: WindowMaterial::default(),
+            sidebar_width: default_sidebar_width(),
+            right_panel_width: default_right_panel_width(),
+            right_click_menu: false,
             ssh_hosts: vec![],
         }
     }
@@ -333,6 +360,7 @@ impl AppData {
             directory: PathBuf::from(&path),
             tabs: vec![],
             selected_tab: None,
+            right_panel_open: false,
             remote: Some(crate::ssh::SshProject { host_id, path }),
         });
         self.selected_workspace = Some(id);
@@ -362,6 +390,7 @@ impl AppData {
             directory,
             tabs: vec![],
             selected_tab: None,
+            right_panel_open: false,
             remote: None,
         });
         self.selected_workspace = Some(id);

@@ -3,6 +3,7 @@ extern crate gpui_kit as gpui;
 mod appearance;
 mod assets;
 mod browser;
+mod material;
 mod project;
 mod render;
 mod ui;
@@ -15,7 +16,7 @@ use vibe_terminal::store::{Store, atomic_write};
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("Vibe Terminal: {e:#}");
+        eprintln!("VibeTerm: {e:#}");
         std::process::exit(1);
     }
 }
@@ -60,14 +61,14 @@ fn run() -> Result<()> {
         .read(true)
         .write(true)
         .open(store.root.join("instance.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock).context("已有 Vibe Terminal 实例正在使用该数据目录")?;
+    fs2::FileExt::try_lock_exclusive(&lock).context("已有 VibeTerm 实例正在使用该数据目录")?;
     let data = store.load()?;
     let session = vibe_terminal::session::Session::new(store, data, Some(lock));
     gpui_kit::application()
         .with_assets(assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            cx.set_app_identity("dev.vibe.terminal", "Vibe Terminal");
+            cx.set_app_identity("dev.vibe.terminal", "VibeTerm");
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
             gpui_kit::component::Theme::update(cx, |theme| {
                 theme.font_family = "Geist".into();
@@ -86,7 +87,7 @@ fn run() -> Result<()> {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(900.0), px(560.0))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Vibe Terminal".into()),
+                    title: Some("VibeTerm".into()),
                     ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
                 app_owns_titlebar_drag: true,

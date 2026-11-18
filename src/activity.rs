@@ -171,7 +171,11 @@ impl Activity {
         self.attention = Some(Indicator::Completed);
     }
     pub fn fallback(&mut self, phase: Phase, seed: bool) -> bool {
-        if self.native || (self.managed && (seed || !matches!(phase, Phase::Error | Phase::Idle))) {
+        // Historical records establish the reader's baseline only. Publishing
+        // their intermediate phase makes a freshly opened/restored tab spin
+        // until a later batch reaches the historical completion. Preserve any
+        // live status already received while those records are being seeded.
+        if self.native || seed || (self.managed && !matches!(phase, Phase::Error | Phase::Idle)) {
             return false;
         }
         let before = self.indicator(true);
@@ -281,7 +285,7 @@ impl ActivityReader {
             if state.cursor.caught_up(path) {
                 state.seeding = false;
             }
-            if changed {
+            if changed || (!seeded && worked) {
                 updates.push(Update {
                     key: state.key.clone(),
                     phase: state.phase,
@@ -454,6 +458,67 @@ mod tests {
         activity.osc("state=working");
         assert!(!activity.fallback(Phase::Done, false));
         assert_eq!(activity.indicator(true), Indicator::Working);
+    }
+    #[test]
+    fn seeded_codex_history_never_becomes_live_activity() {
+        use std::{fs, io::Write};
+        let root = std::env::temp_dir().join(format!("vibe-codex-seed-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(file, r#"{{"type":"event_msg","payload":{{"type":"task_started"}}}}"#).unwrap();
+        // Force history across the cursor's 1 MiB read budget. The historical
+        // completion is deliberately unavailable in the first polling batch.
+        let padding = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","padding":"x".repeat(2048)}});
+        for _ in 0..600 { writeln!(file, "{padding}").unwrap(); }
+        writeln!(file, r#"{{"type":"event_msg","payload":{{"type":"task_complete"}}}}"#).unwrap();
+        drop(file);
+        let mut profile = crate::model::CliProfile::default_shell();
+        profile.kind = CliKind::Codex;
+        let tab = Tab::new(profile, root.clone());
+        let mut reader = ActivityReader::default();
+        reader.cached.insert(tab.id, LogState {
+            key: ConversationKey::for_tab(&tab), source: Some(path.clone()),
+            cursor: JsonlCursor::default(), phase: Phase::Idle, seeding: true,
+        });
+        let mut activity = Activity::default();
+        for expected in [Phase::Working, Phase::Done] {
+            let updates = reader.refresh(std::slice::from_ref(&tab), &root);
+            assert_eq!(updates.len(), 1);
+            assert!(updates[0].seed);
+            assert_eq!(updates[0].phase, expected);
+            activity.fallback(updates[0].phase, updates[0].seed);
+            assert_eq!(activity.indicator(true), Indicator::None,
+                "initial historical batches must never show a spinner or a completion dot");
+        }
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, r#"{{"type":"event_msg","payload":{{"type":"task_started"}}}}"#).unwrap();
+        let updates = reader.refresh(std::slice::from_ref(&tab), &root);
+        assert_eq!(updates.len(), 1);
+        assert!(!updates[0].seed);
+        activity.fallback(updates[0].phase, updates[0].seed);
+        assert_eq!(activity.indicator(true), Indicator::Working);
+        writeln!(file, r#"{{"type":"event_msg","payload":{{"type":"task_complete"}}}}"#).unwrap();
+        let updates = reader.refresh(std::slice::from_ref(&tab), &root);
+        activity.fallback(updates[0].phase, updates[0].seed);
+        assert_eq!(activity.indicator(true), Indicator::Completed);
+        activity.acknowledge();
+        // A previous run can end without a completion. A new task_started must
+        // still publish Working even if the reader's baseline was Working.
+        reader.cached.get_mut(&tab.id).unwrap().seeding = true;
+        writeln!(file, r#"{{"type":"event_msg","payload":{{"type":"task_started"}}}}"#).unwrap();
+        for update in reader.refresh(std::slice::from_ref(&tab), &root) {
+            activity.fallback(update.phase, update.seed);
+        }
+        assert_eq!(activity.indicator(true), Indicator::None);
+        writeln!(file, r#"{{"type":"event_msg","payload":{{"type":"task_started"}}}}"#).unwrap();
+        let updates = reader.refresh(&[tab], &root);
+        assert_eq!(updates.len(), 1, "a live turn must not be hidden by historical Working");
+        assert!(!updates[0].seed);
+        activity.fallback(updates[0].phase, updates[0].seed);
+        assert_eq!(activity.indicator(true), Indicator::Working);
+        drop(file);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn old_pi_logs_only_complete_after_a_new_turn() {

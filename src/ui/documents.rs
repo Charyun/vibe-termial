@@ -368,7 +368,7 @@ impl Ui {
                     .h_full()
                     .flex_shrink_0()
                     .relative()
-                    .bg(rgb(if active { BG } else { PANEL }))
+                    .bg(self.surface_background(if active { BG } else { PANEL }))
                     .border_t_1()
                     .border_color(rgb(if active { 0x8b9c89 } else { PANEL }))
                     .child(Self::tab_separator())
@@ -430,7 +430,7 @@ impl Ui {
             });
         if self.terminal_split_visible() {
             let available = f32::from(window.viewport_size().width)
-                - SIDEBAR_WIDTH
+                - self.sidebar_width - resizing::DIVIDER
                 - if self.panel.open {
                     self.preview_width + 4.0
                 } else {
@@ -440,24 +440,7 @@ impl Ui {
                 .terminal_preview_width
                 .clamp(120.0, (available - 160.0).max(120.0));
             area = area
-                .child(
-                    div()
-                        .id("terminal-preview-divider")
-                        .w(px(4.0))
-                        .h_full()
-                        .flex_shrink_0()
-                        .bg(rgb(SURFACE))
-                        .hover(|style| style.bg(rgb(ACCENT)))
-                        .cursor(CursorStyle::ResizeLeftRight)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|ui, event: &MouseDownEvent, _, _| {
-                                ui.resizing_terminal_preview = true;
-                                ui.resize_origin =
-                                    Some((event.position.x, ui.terminal_preview_width));
-                            }),
-                        ),
-                )
+                .child(self.pane_divider(ResizePane::TerminalPreview, cx))
                 .child(
                     div()
                         .id("terminal-file-preview")
@@ -488,7 +471,7 @@ impl Ui {
             .px_3()
             .py_2()
             .flex_shrink_0()
-            .bg(rgb(PANEL))
+            .bg(self.surface_background(PANEL))
             .child(
                 div()
                     .flex_1()
@@ -575,7 +558,7 @@ impl Ui {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .bg(rgb(BG))
+            .bg(self.surface_background(BG))
             .child(toolbar);
         if let Some(error) = &tab.error {
             pane = pane.child(

@@ -1,7 +1,13 @@
 //! Small native tab indicators, fed by every PTY and legacy session logs.
 #[cfg(all(test, windows))]
+#[path = "codex_startup_native_test.rs"]
+mod codex_startup_native_test;
+#[cfg(all(test, windows))]
 #[path = "activity_native_test.rs"]
 mod native_test;
+#[cfg(all(test, windows))]
+#[path = "running_agent_native_test.rs"]
+mod running_agent_native_test;
 use super::*;
 use gpui_kit::component::{spinner::Spinner, tooltip::Tooltip};
 use vibe_terminal::activity::{ActivityReader, Indicator};
@@ -34,6 +40,31 @@ impl Ui {
         cx.spawn(async move |weak, cx| {
             let mut reader = ActivityReader::default();
             loop {
+                let Ok(shells) = weak.update(cx, |ui, _| {
+                    if ui.demo { Vec::new() } else { ui.session.shell_processes() }
+                }) else { break; };
+                if !shells.is_empty() {
+                    let roots = shells.iter().map(|(_, _, pid)| *pid).collect::<Vec<_>>();
+                    let identities = smol::unblock(move || {
+                        vibe_terminal::running_agent::detect(&roots)
+                    }).await;
+                    if weak.update(cx, |ui, cx| {
+                        let mut changed = false;
+                        for (id, runtime, root) in shells {
+                            if let Some((_, agent)) = identities.iter().find(|(pid, _)| *pid == root)
+                                && ui.session.apply_running_agent(id, runtime, root, agent.clone())
+                            {
+                                ui.conversations.remove(&id);
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            ui.session.persist();
+                            ui.refresh();
+                            cx.notify();
+                        }
+                    }).is_err() { break; }
+                }
                 let Ok((requests, root)) = weak.update(cx, |ui, _| {
                     let requests = ui
                         .session
@@ -51,7 +82,8 @@ impl Ui {
                         })
                         .filter_map(|tab| {
                             let terminal = ui.session.terminals.get(&tab.id)?;
-                            if !terminal.loaded()
+                            if terminal.detected_agent_pid.is_some()
+                                || !terminal.loaded()
                                 || terminal
                                     .buffer
                                     .lock()
@@ -179,15 +211,50 @@ impl Ui {
         surface: &'static str,
     ) -> Option<AnyElement> {
         let indicator = self.agent_activity.get(&id).copied().unwrap_or_default();
+        Self::activity_indicator(id, surface, indicator)
+    }
+    pub(super) fn workspace_activity_state(
+        &self,
+        workspace: &vibe_terminal::model::Workspace,
+    ) -> Indicator {
+        workspace.tabs.iter()
+            .filter_map(|tab| self.agent_activity.get(&tab.id).copied())
+            .max_by_key(|indicator| match indicator {
+                Indicator::Working => 4,
+                Indicator::Blocked => 3,
+                Indicator::Failed => 2,
+                Indicator::Completed => 1,
+                Indicator::None => 0,
+            })
+            .unwrap_or_default()
+    }
+    pub(super) fn workspace_activity_indicator(
+        &self,
+        workspace: &vibe_terminal::model::Workspace,
+    ) -> Option<AnyElement> {
+        if self.expanded_workspaces.contains(&workspace.id) {
+            return None;
+        }
+        Self::activity_indicator(workspace.id, "workspace", self.workspace_activity_state(workspace))
+    }
+    fn activity_indicator(
+        id: Uuid,
+        surface: &'static str,
+        indicator: Indicator,
+    ) -> Option<AnyElement> {
         if indicator == Indicator::None {
             return None;
         }
-        let label = match indicator {
-            Indicator::None => "等待输入",
-            Indicator::Working => "正在处理",
-            Indicator::Blocked => "等待确认或输入",
-            Indicator::Completed => "已完成 · 点击标签清除提示",
-            Indicator::Failed => "任务出错 · 点击标签清除提示",
+        let label = match (surface, indicator) {
+            ("workspace", Indicator::Working) => "有会话正在处理 · 展开工作区查看",
+            ("workspace", Indicator::Blocked) => "有会话等待确认或输入 · 展开工作区查看",
+            ("workspace", Indicator::Completed) => "有会话已完成 · 展开工作区查看",
+            ("workspace", Indicator::Failed) => "有会话任务出错 · 展开工作区查看",
+            (_, Indicator::None) => "等待输入",
+            (_, Indicator::Working) => "正在处理",
+            (_, Indicator::Blocked) => "等待确认或输入",
+            (_, Indicator::Completed) => "已完成 · 点击标签清除提示",
+            (_, Indicator::Failed) => "任务出错 · 点击标签清除提示",
         };
         let mut slot = div()
             .id(SharedString::from(format!("agent-status-{surface}-{id}")))

@@ -10,11 +10,11 @@ fn main() {
         // The same embedded group is used by Explorer and the taskbar.
         tauri_winres::WindowsResource::new()
             .set_icon_with_id("assets/icons/app.ico", "1")
-            .set("ProductName", "Vibe Terminal")
-            .set("FileDescription", "Vibe Terminal")
+            .set("ProductName", "VibeTerm")
+            .set("FileDescription", "VibeTerm")
             .set("InternalName", "vibe-terminal")
             .set("OriginalFilename", "vibe-terminal.exe")
             .compile_for(&["vibe-terminal"])
-            .expect("failed to embed the Vibe Terminal Windows icon");
+            .expect("failed to embed the VibeTerm Windows icon");
     }
 }

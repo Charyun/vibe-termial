@@ -1,3 +1,6 @@
+#[cfg(all(test, windows))]
+#[path = "panel_workspace_native_test.rs"]
+mod workspace_native_test;
 use super::*;
 use crate::{appearance::icon, project};
 use gpui_kit::prelude::FluentBuilder;
@@ -13,6 +16,7 @@ pub(super) enum PanelTab {
 pub(super) struct ProjectPanel {
     pub open: bool,
     pub tab: PanelTab,
+    workspace: Option<Uuid>,
     root: Option<PathBuf>,
     directories: HashMap<PathBuf, project::Directory>,
     expanded: HashSet<PathBuf>,
@@ -25,17 +29,38 @@ pub(super) struct ProjectPanel {
     diff_request: Option<Uuid>,
     selected: Option<(PathBuf, bool)>,
 }
+impl ProjectPanel {
+    pub(super) fn for_workspace(data: &vibe_terminal::model::AppData) -> Self {
+        Self {
+            workspace: data.workspace().map(|workspace| workspace.id),
+            open: data.workspace().is_some_and(|workspace| workspace.right_panel_open),
+            ..Default::default()
+        }
+    }
+}
 impl Ui {
+    pub(super) fn set_project_panel_open(&mut self, open: bool) {
+        self.panel.open = open;
+        if let Some(workspace) = self.session.data.workspace_mut() {
+            workspace.right_panel_open = open;
+        }
+        self.session.persist();
+        self.sync_project_panel();
+    }
     pub(super) fn sync_project_panel(&mut self) {
-        let root = self
-            .session
-            .data
-            .workspace()
+        let workspace = self.session.data.workspace();
+        let workspace_id = workspace.map(|workspace| workspace.id);
+        let root = workspace
             .filter(|w| w.remote.is_none())
             .map(|w| w.directory.clone());
-        if self.panel.root != root {
-            let open = self.panel.open;
+        if self.panel.workspace != workspace_id || self.panel.root != root {
+            let open = if self.panel.workspace != workspace_id {
+                workspace.is_some_and(|workspace| workspace.right_panel_open)
+            } else {
+                self.panel.open
+            };
             self.panel = ProjectPanel {
+                workspace: workspace_id,
                 root: root.clone(),
                 open,
                 ..Default::default()
@@ -413,7 +438,7 @@ impl Ui {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .bg(rgb(PANEL))
+                    .bg(self.surface_background(PANEL))
                     .child(icon("file-diff"))
                     .child(div().text_xs().truncate().child(display_path(&diff.path))),
             )
@@ -457,7 +482,7 @@ impl Ui {
             .items_center()
             .h(px(40.0))
             .flex_shrink_0()
-            .bg(rgb(PANEL));
+            .bg(self.surface_background(PANEL));
         for (tab, name) in [
             (PanelTab::Explorer, "资源管理器"),
             (PanelTab::Changes, "源代码控制"),
@@ -471,7 +496,7 @@ impl Ui {
                     .flex()
                     .items_center()
                     .text_xs()
-                    .bg(rgb(if active { BG } else { PANEL }))
+                    .bg(self.surface_background(if active { BG } else { PANEL }))
                     .text_color(rgb(if active { FG } else { MUTED }))
                     .cursor_pointer()
                     .border_b_1()
@@ -513,7 +538,7 @@ impl Ui {
             .h_full()
             .flex_shrink_0()
             .min_w_0()
-            .bg(rgb(BG))
+            .bg(self.surface_background(BG))
             .child(tabs);
         let sidebar_preview = self.split_preview_owner.is_none()
             && (self.preview.is_some() || self.preview_request.is_some());

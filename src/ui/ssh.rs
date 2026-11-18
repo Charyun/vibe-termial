@@ -375,6 +375,7 @@ impl Ui {
             .bg(rgb(PANEL))
             .border_1()
             .border_color(rgb(0x454545));
+        let primary_action: Button;
         match modal {
             SshModal::Workspace {
                 remote,
@@ -413,41 +414,39 @@ impl Ui {
                 }
                 body = body.child(modes);
                 if !remote {
-                    body = body
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(MUTED))
-                                .child("选择本机已有的项目目录，在该目录下启动终端。"),
-                        )
-                        .child(Self::primary(
-                            "pick-local-workspace",
-                            "选择本地项目目录",
-                            cx,
-                            |s, w, cx| {
-                                s.ssh.modal = None;
-                                s.pick_local_workspace(w, cx);
-                            },
-                        ));
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("选择本机已有的项目目录，在该目录下启动终端。"),
+                    );
+                    primary_action = Self::primary(
+                        "pick-local-workspace",
+                        "选择本地项目目录",
+                        cx,
+                        |s, w, cx| {
+                            s.ssh.modal = None;
+                            s.pick_local_workspace(w, cx);
+                        },
+                    );
                 } else if self.session.data.ssh_hosts.is_empty() {
-                    body = body
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(MUTED))
-                                .child("请先在设置中添加 SSH 主机。"),
-                        )
-                        .child(Self::primary(
-                            "workspace-configure-ssh",
-                            "添加远端主机",
-                            cx,
-                            |s, w, cx| {
-                                s.ssh.modal = None;
-                                s.open_settings(w, cx);
-                                s.settings_tab = SettingsTab::SshHosts;
-                                cx.notify();
-                            },
-                        ));
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("请先在设置中添加 SSH 主机。"),
+                    );
+                    primary_action = Self::primary(
+                        "workspace-configure-ssh",
+                        "添加远端主机",
+                        cx,
+                        |s, w, cx| {
+                            s.ssh.modal = None;
+                            s.open_settings(w, cx);
+                            s.settings_tab = SettingsTab::SshHosts;
+                            cx.notify();
+                        },
+                    );
                 } else {
                     body = body.child(div().text_xs().text_color(rgb(MUTED)).child("选择远端机器"));
                     let mut hosts = div()
@@ -502,13 +501,13 @@ impl Ui {
                     body = body
                         .child(hosts)
                         .child(field("远程项目目录", path))
-                        .child(field("工作区名称（可选）", name))
-                        .child(Self::primary(
-                            "connect-remote-workspace",
-                            "连接并创建工作区",
-                            cx,
-                            |s, w, cx| s.connect_remote_workspace(w, cx),
-                        ));
+                        .child(field("工作区名称（可选）", name));
+                    primary_action = Self::primary(
+                        "connect-remote-workspace",
+                        "连接并创建工作区",
+                        cx,
+                        |s, w, cx| s.connect_remote_workspace(w, cx),
+                    );
                 }
                 if let Some(error) = error {
                     body = body.child(
@@ -556,24 +555,46 @@ impl Ui {
                             .child(error.clone()),
                     );
                 }
-                body = body.child(Self::primary(
+                primary_action = Self::primary(
                     "save-ssh-host",
                     "保存主机",
                     cx,
                     |s, w, cx| s.save_ssh_host(w, cx),
-                ));
+                );
             }
         }
-        body = body.child(Self::button(
-            "cancel-ssh-modal",
-            "取消",
-            cx,
-            |s, w, cx| {
-                s.ssh.modal = None;
-                s.focus_current_view(w, cx);
-                cx.notify();
-            },
-        ));
+        body = body.child(
+            div()
+                .id("workspace-modal-actions")
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap_3()
+                .pt_3()
+                .flex_shrink_0()
+                .child(
+                    Self::button("cancel-ssh-modal", "取消", cx, |s, w, cx| {
+                        s.ssh.modal = None;
+                        s.focus_current_view(w, cx);
+                        cx.notify();
+                    })
+                    .with_size(gpui_kit::component::Size::Size(px(40.0)))
+                    .h(px(40.0))
+                    .min_w(px(96.0))
+                    .px_3()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD),
+                )
+                .child(
+                    primary_action
+                        .with_size(gpui_kit::component::Size::Size(px(40.0)))
+                        .h(px(40.0))
+                        .min_w(px(160.0))
+                        .px_3()
+                        .text_base()
+                        .font_weight(FontWeight::SEMIBOLD),
+                ),
+        );
         div()
             .absolute()
             .inset_0()

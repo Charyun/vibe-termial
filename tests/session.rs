@@ -31,6 +31,30 @@ fn general_cursor_style_defaults_to_block_and_persists_both_choices() {
 }
 
 #[test]
+fn right_panel_visibility_is_saved_per_workspace_and_defaults_closed_for_legacy_data() {
+    let (root, store, mut data) = setup();
+    let first = data.selected_workspace.unwrap();
+    let second_path = root.join("second");
+    fs::create_dir_all(&second_path).unwrap();
+    let second = data.add_workspace(&second_path).unwrap();
+    assert!(!data.workspace().unwrap().right_panel_open);
+    data.selected_workspace = Some(first);
+    data.workspace_mut().unwrap().right_panel_open = true;
+    store.save(&data).unwrap();
+    let mut restored = store.load().unwrap();
+    assert!(restored.workspace().unwrap().right_panel_open);
+    restored.selected_workspace = Some(second);
+    assert!(!restored.workspace().unwrap().right_panel_open);
+    let mut legacy = serde_json::to_value(restored).unwrap();
+    for workspace in legacy["workspaces"].as_array_mut().unwrap() {
+        workspace.as_object_mut().unwrap().remove("right_panel_open");
+    }
+    let legacy: AppData = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.workspaces.iter().all(|workspace| !workspace.right_panel_open));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn legacy_page_fields_are_ignored_without_losing_workspace_selection() {
     let (root, _store, data) = setup();
     for page in [None, Some("overview"), Some("terminal")] {

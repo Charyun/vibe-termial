@@ -3,9 +3,11 @@ pub mod agents;
 #[cfg(feature = "desktop")]
 pub mod clipboard;
 pub mod conversation;
+pub mod file_drop;
 mod jsonl;
 pub mod model;
 pub mod paths;
+pub mod running_agent;
 pub mod scroll;
 pub mod session;
 pub mod ssh;

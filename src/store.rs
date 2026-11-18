@@ -51,14 +51,22 @@ impl Store {
         data.profiles
             .retain(|profile| profile.kind == crate::model::CliKind::Shell);
         for required in crate::model::CliProfile::defaults() {
-            if !data
+            if let Some(profile) = data
                 .profiles
-                .iter()
-                .any(|profile| profile.id == required.id)
+                .iter_mut()
+                .find(|profile| profile.id == required.id)
             {
+                // 内置终端名称随当前平台更新，避免旧配置继续显示 Shell。
+                profile.name = required.name;
+            } else {
                 data.profiles.push(required);
             }
         }
+        data.profiles.sort_by_key(|profile| match profile.id.as_str() {
+            "shell" => 0,
+            "powershell" => 1,
+            _ => 2,
+        });
         Ok(data)
     }
     pub fn save(&self, data: &AppData) -> Result<()> {
