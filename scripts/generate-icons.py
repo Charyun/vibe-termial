@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Vibe Terminal brand assets. Requires Pillow only when regenerating.
+"""Generate the VibeTerm brand assets. Requires Pillow only when regenerating.
 
 Normal Cargo builds use the checked-in images and do not run this script.
 The vector and bitmap versions share the same geometry and colors below.

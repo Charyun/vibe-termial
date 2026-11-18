@@ -1,4 +1,4 @@
-# Vibe Terminal 交互原型
+# VibeTerm 交互原型
 
 用浏览器直接打开 [index.html](index.html)。无需构建或启动后端，字体从项目的 `assets/fonts` 本地加载。
 

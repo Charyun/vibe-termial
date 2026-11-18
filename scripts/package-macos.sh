@@ -13,7 +13,7 @@ if [[ -z "$target_directory" ]]; then
   exit 1
 fi
 cargo build --release --locked
-bundle="$target_directory/bundle/Vibe Terminal.app"
+bundle="$target_directory/bundle/VibeTerm.app"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "$target_directory/release/vibe-terminal" "$bundle/Contents/MacOS/vibe-terminal"
 cp assets/macos/Info.plist "$bundle/Contents/Info.plist"

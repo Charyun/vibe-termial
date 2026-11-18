@@ -1,4 +1,4 @@
-# Vibe Terminal application icon
+# VibeTerm application icon
 
 The mint terminal prompt is the application's brand mark. The header and Windows executable use the same geometry and colors.
 
@@ -19,6 +19,6 @@ Normal builds do not require Python or Pillow. The generated assets are embedded
 
 On Windows, `build.rs` embeds `app.ico` as icon group **1** using `tauri-winres`. This ID is deliberate: GPUI's Windows backend loads icon resource 1 and installs it as the window-class icon, which Windows also uses for the taskbar. Explorer reads the same group from the executable. `tauri-winres::set_icon()` defaults to a different ID, so use `set_icon_with_id(..., "1")` here.
 
-The application identity is `dev.vibe.terminal`, displayed as **Vibe Terminal**. Native header rendering uses the embedded `logo.png`; it does not depend on finding an image next to the executable.
+The application identity is `dev.vibe.terminal`, displayed as **VibeTerm**. Native header rendering uses the embedded `logo.png`; it does not depend on finding an image next to the executable.
 
 Verified on Windows with `cargo build --locked` and an isolated application window. All nine embedded frames decoded successfully. The window-class icon and Windows' extracted executable icon rendered identically when the verification process used per-monitor DPI awareness. Native-window evidence is under `target/icon-verification/`.

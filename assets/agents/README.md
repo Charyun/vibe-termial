@@ -1,6 +1,6 @@
 # Agent icon sources
 
-These images are bundled locally for offline use in the Vibe Terminal native desktop app. Agent names and marks belong to their respective owners.
+These images are bundled locally for offline use in the VibeTerm native desktop app. Agent names and marks belong to their respective owners.
 
 Source repository: https://github.com/stablyai/orca
 

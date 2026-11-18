@@ -151,14 +151,14 @@ def main() -> None:
     if not executable.is_file():
         raise RuntimeError(f"Release executable missing: {executable}")
     variant = "single-exe" if args.single_exe else "portable"
-    name = f"VibeTerminal-{package['version']}-windows-x64-{variant}"
+    name = f"VibeTerm-{package['version']}-windows-x64-{variant}"
     output = (ROOT / args.output_dir).resolve()
     folder = output / name
     archive = output / (name + ".zip")
     if folder.exists() or archive.exists():
         raise RuntimeError(f"Output already exists. Choose a fresh --output-dir: {output}")
     folder.mkdir(parents=True)
-    shutil.copy2(executable, folder / executable.name)
+    shutil.copy2(executable, folder / "VibeTerm.exe")
     if args.single_exe:
         system = pe_imports(executable)
         dynamic_crt = [name for name in system if name.lower().startswith(("vcruntime", "msvcp", "concrt"))]
@@ -167,11 +167,11 @@ def main() -> None:
         bundled = []
     else:
         bundled, system = copy_runtime(executable, folder, find_crt(args.crt_dir))
-        launcher = '@echo off\r\nsetlocal\r\nset "VIBE_TERMINAL_DATA_DIR=%~dp0data"\r\nstart "" /D "%~dp0" "%~dp0vibe-terminal.exe"\r\n'
+        launcher = '@echo off\r\nsetlocal\r\nset "VIBE_TERMINAL_DATA_DIR=%~dp0data"\r\nstart "" /D "%~dp0" "%~dp0VibeTerm.exe"\r\n'
         (folder / "StartPortable.cmd").write_bytes(launcher.encode("ascii"))
         (folder / "data").mkdir()
         (folder / "data" / "README.txt").write_text("Portable application state is stored here when using StartPortable.cmd.\nNo personal state is included in this package.\n", encoding="utf-8")
-    readme = f"""Vibe Terminal {package['version']} - Windows x64 portable
+    readme = f"""VibeTerm {package['version']} - Windows x64 portable
 
 快速开始
 1. 将整个 ZIP 解压到可写目录，不要直接从压缩包内运行。
@@ -179,7 +179,7 @@ def main() -> None:
 3. 工作区配置、终端历史和会话数据写入本目录下的 data 文件夹。
 4. 关闭软件后，可将整个文件夹移动或复制到其他位置。
 
-直接运行 vibe-terminal.exe 也可以，但会沿用应用默认的系统用户数据目录；
+直接运行 VibeTerm.exe 也可以，但会沿用应用默认的系统用户数据目录；
 如需配置跟随便携包，请使用 StartPortable.cmd。
 
 运行条件
@@ -196,9 +196,9 @@ def main() -> None:
 许可与来源见 LICENSES、THIRD-PARTY-NOTICES.txt 和 BUILD-INFO.json。
 """
     if args.single_exe:
-        readme = f"""Vibe Terminal {package['version']} - Windows x64 single-exe Release
+        readme = f"""VibeTerm {package['version']} - Windows x64 single-exe Release
 
-直接双击 vibe-terminal.exe 即可运行，无需安装器、启动脚本或旁带 DLL。
+直接双击 VibeTerm.exe 即可运行，无需安装器、启动脚本或旁带 DLL。
 Visual C++ 运行库已静态链接；字体、图标和远程页面资源已嵌入 exe。
 你可以只复制这个 exe 到其他可写目录或电脑上运行。
 
@@ -217,7 +217,7 @@ Visual C++ 运行库已静态链接；字体、图标和远程页面资源已嵌
     licenses = folder / "LICENSES"
     licenses.mkdir()
     for source, target in [
-        (ROOT / "LICENSE", "VibeTerminal-MIT.txt"),
+        (ROOT / "LICENSE", "VibeTerm-MIT.txt"),
         (ROOT / "assets/fonts/Geist-OFL.txt", "Geist-OFL.txt"),
         (ROOT / "assets/fonts/GeistMono-OFL.txt", "GeistMono-OFL.txt"),
         (ROOT / "assets/agents/LICENSE.orca", "Orca-MIT.txt"),
@@ -230,7 +230,7 @@ Visual C++ 运行库已静态链接；字体、图标和远程页面资源已嵌
         (licenses / "Microsoft-runtime.txt").write_text("Microsoft Visual C++ Runtime DLLs are redistributed app-locally from the Visual Studio x64 redistributable directory.\nCopyright Microsoft Corporation. All rights reserved.\nhttps://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files\n", encoding="utf-8")
     notices(metadata, folder)
     files = [{"path":str(p.relative_to(folder)).replace("\\", "/"), "bytes":p.stat().st_size, "sha256":hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted(folder.rglob("*")) if p.is_file()]
-    info = {"product":"Vibe Terminal", "version":package["version"], "profile":"release", "target":"x86_64-pc-windows-msvc", "packaged_utc":datetime.now(timezone.utc).isoformat(), "git_commit":command("git", "rev-parse", "HEAD"), "working_tree_dirty":bool(command("git", "status", "--porcelain")), "rustc":command("rustc", "--version"), "bundled_runtime_dlls":bundled, "system_imports":system, "static_crt":args.single_exe, "data_directory":"Windows user data directory" if args.single_exe else "data (via StartPortable.cmd)", "files":files}
+    info = {"product":"VibeTerm", "version":package["version"], "profile":"release", "target":"x86_64-pc-windows-msvc", "packaged_utc":datetime.now(timezone.utc).isoformat(), "git_commit":command("git", "rev-parse", "HEAD"), "working_tree_dirty":bool(command("git", "status", "--porcelain")), "rustc":command("rustc", "--version"), "bundled_runtime_dlls":bundled, "system_imports":system, "static_crt":args.single_exe, "data_directory":"Windows user data directory" if args.single_exe else "data (via StartPortable.cmd)", "files":files}
     (folder / "BUILD-INFO.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
         for file in sorted(folder.rglob("*")):
@@ -241,7 +241,7 @@ Visual C++ 运行库已静态链接；字体、图标和远程页面资源已嵌
     checksum.write_text(f"{digest}  {archive.name}\n", encoding="ascii")
     standalone = None
     if args.single_exe:
-        standalone = output / f"VibeTerminal-{package['version']}-windows-x64.exe"
+        standalone = output / f"VibeTerm-{package['version']}-windows-x64.exe"
         if standalone.exists():
             raise RuntimeError(f"Standalone output already exists: {standalone}")
         shutil.copy2(executable, standalone)

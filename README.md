@@ -1,4 +1,4 @@
-# Vibe Terminal
+# VibeTerm
 
 使用 **Rust + GPUI + GPUI Kit** 的 AI Coding 桌面终端管理器，面向 Windows 和 macOS。界面已从 Rune 迁移到 GPUI Kit 0.9.1，现有工作区、标签和历史数据保持兼容。
 
@@ -103,6 +103,8 @@ cargo test --locked --bin vibe-terminal native_web_preview_loads_javascript -- -
 
 ## 快捷键
 
+终端获得焦点时，Tab、Shift+Tab、Esc、功能键和 Ctrl 组合键优先发送给 Shell / Agent；例如 Ctrl+W 删除前一个单词，Ctrl+C 中断，Ctrl+V 由终端程序处理。普通文本及中文输入沿用系统输入法。以下界面快捷键仅在终端输入区之外生效。
+
 | 快捷键 | 作用 |
 | --- | --- |
 | `Ctrl + T` | 新建终端（默认 CMD） |
@@ -116,7 +118,7 @@ cargo test --locked --bin vibe-terminal native_web_preview_loads_javascript -- -
 | `Ctrl + /` 或 `F1` | 打开设置里的快捷键页 |
 | `Esc` | 关闭对话框、菜单或设置页 |
 
-Windows 未选中文本时，`Ctrl + C` 发送终端中断信号；选中文本后走复制。
+终端选中文本时，Ctrl+C 仍发送终端中断信号。
 ## 界面与预览
 
 工作区直接展示终端标签；没有标签时显示新建终端入口。右侧预览区支持源码、图片和网页。Agent 的模型调用和工具执行由原 CLI 完成，客户端的终端与内容视图共用它的会话。
@@ -225,7 +227,7 @@ Windows 原生受控测试工作区可用 `./scripts/native-smoke.ps1` 启动。
 
 Windows 已验证：GPUI 原生窗口、文件路径点击和行高亮、本地图片预览、真实 PowerShell 输入输出、Unicode 文本提交、关闭时进程退出，以及重开后不自动启动终端。
 
-macOS 的编译和原生交互仍待真机验证。IME 接口使用真实终端光标作为候选框锚点，即使 Pi 隐藏硬件光标也保留输入位置；Windows 原生 IMM 接口已在 150% 缩放下验证坐标。Windows 下由客户端启动的 Pi 进程还会启用 `PI_HARDWARE_CURSOR=1`，让 ConPTY 保留编辑光标位置，避免输入法锚点停在重绘后的行尾；不修改全局 Pi 配置。真实拼音/日文候选窗的完整组合输入、组合键和跨屏 DPI 场景仍需要人工验收。VT 支持尚未覆盖 Kitty 键盘协议、图形协议及所有终端鼠标协议；已支持向 TUI 转发滚轮、左键按下、拖动和松开，未声明鼠标模式的普通终端仍使用本地文字选择。备用屏幕在无鼠标协议时将滚轮映射为方向键。
+macOS 的编译和原生交互仍待真机验证。IME 接口使用真实终端光标作为候选框锚点，即使 Pi 隐藏硬件光标也保留输入位置；Windows 原生 IMM 接口已在 150% 缩放下验证坐标。Windows 下由客户端启动的 Pi 进程还会启用 `PI_HARDWARE_CURSOR=1`，让 ConPTY 保留编辑光标位置，避免输入法锚点停在重绘后的行尾；不修改全局 Pi 配置。真实拼音/日文候选窗的完整组合输入、组合键和跨屏 DPI 场景仍需要人工验收。VT 支持尚未覆盖 Kitty 键盘协议、图形协议及所有终端鼠标协议；已支持向 TUI 转发滚轮、左键按下、拖动和松开，未声明鼠标模式的普通终端仍使用本地文字选择。备用屏幕本身不会触发方向键模拟：识别到的 Pi/Codex/Claude 使用原生鼠标滚轮协议（包括 CMD/PowerShell 内启动的 Agent），其他情况只滚动本地历史，不会把滚轮变成输入框的上下方向键。
 
 已安装 Pi 时，可在隔离的 `PI_CODING_AGENT_DIR` 下设置 `PI_OFFLINE=1`，运行 `cargo test --locked --no-default-features --test pi_scroll -- --ignored` 验证真实 ConPTY 会话的滚动条双向拖动和 “Jump to latest message” 点击；测试使用生成的会话历史，不发送模型请求。
 
